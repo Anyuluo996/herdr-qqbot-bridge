@@ -46,9 +46,9 @@ HELP = (
     "· #esc — 发 Esc 中断；#key 键名 — 发按键\n"
     "· #help — 本说明\n\n"
     "**透传**（插件不接管）\n"
-    "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时流式显示思维链/工具调用）\n"
+    "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时流式显示思维链/工具调用；agent 忙时自动排队，📥 回执）\n"
     "· pi> 文字 或 @pi 文字 — 指名发给某个 agent，不改变默认目标（可并行多线对话）\n"
-    "· /xxx = agent 自己的命令（/model /clear…）\n"
+    "· /xxx = agent 自己的命令（/model /clear…，⌨️ 回执）\n"
     "· 引用我的通知 = 精确路由到那条通知对应的 agent"
 )
 
@@ -116,8 +116,10 @@ def agent_label(agent: dict) -> str:
     return " · ".join(parts)
 
 
-def submit(cfg: dict, pane: str, text: str) -> str:
-    """Send text to an agent and make sure it actually goes in. Returns an error, or "".
+def submit(cfg: dict, pane: str, text: str) -> tuple[str, bool]:
+    """Send text to an agent and make sure it actually goes in. Returns
+    (error, queued) — queued means the agent was mid-task, so the prompt sits
+    in its input queue until the current turn ends. Returns an error, or "".
 
     `herdr agent prompt` writes the text and the submit key in one burst. An agent that
     is already working queues that fine, but an idle Claude Code folds the trailing
@@ -128,18 +130,18 @@ def submit(cfg: dict, pane: str, text: str) -> str:
     was_working = agent_status(pane) == "working"
     _, err = qq.herdr_run("agent", "prompt", pane, text, timeout=60)
     if err:
-        return err
+        return err, False
     if was_working or not cfg.get("submit_fallback", True):
-        return ""
+        return "", was_working
     deadline = time.monotonic() + int(cfg.get("submit_wait_ms", 2500)) / 1000
     while time.monotonic() < deadline:
         time.sleep(0.25)
         status = agent_status(pane)
         if not status or status == "working":
-            return ""  # picked it up (or we can't tell — better than a double submit)
+            return "", False  # picked it up (or we can't tell — better than a double submit)
     qq.log(f"bot: {pane} never started working; pressing enter to submit")
     _, err = qq.herdr_run("agent", "send-keys", pane, "enter")
-    return err
+    return err, False
 
 
 # --- outgoing ----------------------------------------------------------------
@@ -544,24 +546,32 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
     deadline = time.monotonic() + int(cfg.get("stream_max_seconds", 600))
     import notify  # lazy: transcript parsing is only needed while streaming
 
-    agent = kind = cwd = ""
-    tpath = ""
+    agent = ""
     info, err = qq.herdr_json("agent", "get", pane, timeout=10)
     if not err:
+        agent = info.get("agent", {}).get("display_agent") \
+            or info.get("agent", {}).get("agent") or ""
+
+    def resolve_transcript() -> tuple[str, str]:
+        info, err = qq.herdr_json("agent", "get", pane, timeout=10)
+        if err:
+            return "", ""
         a = info.get("agent", {})
-        agent = a.get("display_agent") or a.get("agent") or ""
-        kind = a.get("agent") or ""
-        cwd = a.get("cwd") or a.get("foreground_cwd") or ""
-        tpath = (notify.session_file(kind, a.get("agent_session") or {})
-                 or notify.session_file_fallback(kind, cwd))
+        k = a.get("agent") or ""
+        c = a.get("cwd") or a.get("foreground_cwd") or ""
+        p = (notify.session_file(k, a.get("agent_session") or {})
+             or notify.session_file_fallback(k, c))
+        return (p if p and os.path.isfile(p) else ""), k
+
+    # a session created by this very prompt doesn't exist yet — resolve_transcript
+    # is re-run every poll until the file shows up
+    tpath, kind = resolve_transcript()
     offset = 0
-    if tpath and os.path.isfile(tpath):
+    if tpath:
         try:
             offset = os.path.getsize(tpath)
         except OSError:
             tpath = ""
-    else:
-        tpath = ""
     qq.log(f"stream: source={'transcript' if tpath else 'terminal'} ({agent}, {kind})")
 
     seen: set[str] = set()
@@ -605,6 +615,12 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                     or (not saw_working and time.monotonic() > grace
                         and status != "working"))
         fresh = ""
+        if not tpath:
+            tpath, kind = resolve_transcript()
+            if tpath:
+                offset = 0
+                seen.clear()
+                qq.log(f"stream: source switched to transcript ({kind})")
         if tpath:
             fresh, offset = notify.transcript_step_lines(kind, tpath, offset, compact=compact)
         else:
@@ -791,7 +807,7 @@ def handle_attachment(cfg: dict, scene: str, openid: str, msg_id: str, target: d
     if not paths:
         return
     prompt = "\n".join(([caption] if caption else []) + paths)
-    err = submit(cfg, target["pane"], prompt)
+    err, _queued = submit(cfg, target["pane"], prompt)
     if err:
         report_failure(cfg, scene, openid, msg_id, target, err)
         return
@@ -852,7 +868,7 @@ def handle_message(cfg: dict, d: dict) -> None:
         target = resolve(cfg, scene, reply_to, msg_id, d)
         if not target.get("pane"):
             return
-    err = submit(cfg, target["pane"], text2)
+    err, queued = submit(cfg, target["pane"], text2)
     if err:
         qq.log(f"bot: prompt {target['pane']} failed: {err}")
         report_failure(cfg, scene, reply_to, msg_id, target, err)
@@ -861,6 +877,14 @@ def handle_message(cfg: dict, d: dict) -> None:
         qq.set_current_target(target)
     qq.log(f"bot: prompted {target['pane']} ({len(text2)} chars"
            f"{', addressed' if addressed else ''})")
+    # slash commands open things in the agent's TUI and never produce a status
+    # event, so they always get a delivery ack; plain prompts only when queued
+    # behind a running task (otherwise the completion push is the receipt)
+    if text2.startswith("/"):
+        reply(cfg, scene, reply_to, f"⌨️ {text2[:30]} → {qq.label(target)}", msg_id, target=target)
+    elif queued:
+        reply(cfg, scene, reply_to, f"📥 已排队（{qq.label(target)} 完成当前任务后执行）",
+              msg_id, target=target)
     if scene == "c2c" and cfg.get("stream_progress", True) and not text2.startswith("/"):
         # live progress: one QQ streaming message grows with the terminal while
         # the agent works (c2c only — group messages don't support streaming)
