@@ -868,28 +868,30 @@ def handle_attachment(cfg: dict, scene: str, openid: str, msg_id: str, target: d
     reply(cfg, scene, openid, f"📎 {names} → {qq.label(target)}", msg_id, target=target)
 
 
+def pane_tail_lines(pane: str, lines: int = 30) -> list:
+    out, err = qq.herdr_run("agent", "read", pane, "--lines", str(lines),
+                            "--format", "text", timeout=10)
+    if err:
+        return []
+    return [l.rstrip() for l in out.splitlines() if l.strip()]
+
+
 def capture_slash_reply(cfg: dict, scene: str, reply_to: str, msg_id: str,
-                        target: dict, cmd: str) -> None:
+                        target: dict, cmd: str, before: set) -> None:
     """Slash commands answer inside the agent's TUI (model pickers, tables) and
-    never fire a status event — wait a beat, diff the pane tail and push whatever
-    the command rendered. Box-drawing tables ARE the reply here, so only pure
-    spinner frames are filtered (unlike the stream path)."""
+    never fire a status event — diff the pane tail against the PRE-SEND snapshot
+    and push whatever appeared. The snapshot must predate the submit: submit
+    itself waits seconds for a working status that never comes, and pickers
+    render in under one — a post-send snapshot would already contain the reply
+    and the diff would be empty forever. Box-drawing tables ARE the reply here,
+    so only pure spinner frames are filtered (unlike the stream path)."""
     pane = target["pane"]
-
-    def tail() -> list:
-        out, err = qq.herdr_run("agent", "read", pane, "--lines", "30",
-                                "--format", "text", timeout=10)
-        if err:
-            return []
-        return [l.rstrip() for l in out.splitlines() if l.strip()]
-
-    before = set(tail())
     parts: list[str] = []
     for _ in range(3):
         time.sleep(5)
-        fresh = [l for l in tail() if l not in before
+        fresh = [l for l in pane_tail_lines(pane) if l not in before
                  and not re.search(r"[\u2800-\u28FF]", l)]
-        before = set(tail())
+        before = set(pane_tail_lines(pane))
         if fresh:
             parts.extend(fresh)
             if len(parts) > 8:  # picker table captured — enough
@@ -954,6 +956,9 @@ def handle_message(cfg: dict, d: dict) -> None:
         target = resolve(cfg, scene, reply_to, msg_id, d)
         if not target.get("pane"):
             return
+    # snapshot before the command goes in — the reply diff baseline (see
+    # capture_slash_reply)
+    pre_tail = set(pane_tail_lines(target["pane"])) if text2.startswith("/") else set()
     err, queued = submit(cfg, target["pane"], text2)
     if err:
         qq.log(f"bot: prompt {target['pane']} failed: {err}")
@@ -970,7 +975,8 @@ def handle_message(cfg: dict, d: dict) -> None:
         reply(cfg, scene, reply_to, f"⌨️ {text2[:30]} → {qq.label(target)}", msg_id, target=target)
         # the command's answer renders in the TUI — bring it back to QQ
         threading.Thread(target=capture_slash_reply, daemon=True,
-                         args=(cfg, scene, reply_to, msg_id, target, text2)).start()
+                         args=(cfg, scene, reply_to, msg_id, target, text2,
+                               pre_tail)).start()
     elif queued:
         reply(cfg, scene, reply_to, f"📥 已排队（{qq.label(target)} 完成当前任务后执行）",
               msg_id, target=target)
