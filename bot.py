@@ -595,8 +595,15 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
     touch()
     if not chunk(1, f"⏳ {label}\n"):
         return
+    saw_working = False
+    grace = time.monotonic() + 30  # prompt injection registers late on some CLIs
     while time.monotonic() < deadline:
         status = agent_status(pane)
+        if status == "working":
+            saw_working = True
+        finished = ((saw_working and status not in ("working", "unknown", ""))
+                    or (not saw_working and time.monotonic() > grace
+                        and status != "working"))
         fresh = ""
         if tpath:
             fresh, offset = notify.transcript_step_lines(kind, tpath, offset, compact=compact)
@@ -612,12 +619,19 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                     new_lines.append(ln)
                 if new_lines:
                     fresh = "\n".join(new_lines) + "\n"
-        if status not in ("working", "unknown", ""):
+        if finished:
             # the stream message carries the answer (the completion push is
             # suppressed for this pane), but streams have a total length budget —
             # whatever doesn't fit goes out as regular follow-up messages so a
             # long reply is never silently truncated
             final = notify.reply_snippet_of_pane(pane)
+            if not final:
+                out, perr = qq.herdr_run("agent", "read", pane, "--lines", "25",
+                                         "--format", "text", timeout=10)
+                if not perr and out.strip():
+                    lines = [l.rstrip() for l in out.splitlines()
+                             if l.strip() and not SPINNER_RE.search(l)]
+                    final = "\n".join(lines[-30:])
             head = "✅ " + final
             cap = max(600, int(cfg.get("stream_total_chars", 3000)))
             fits = max(200, cap - sent_chars)

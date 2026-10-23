@@ -475,17 +475,30 @@ def transcript_step_lines(agent: str, path: str, offset: int,
         except Exception:
             continue
         if agent == "agy":
-            # flat entries: type USER_INPUT/EPHEMERAL_MESSAGE/PLANNER_RESPONSE/
-            # TOOL_*/…, content as plain text
+            # planner turns carry thinking + tool_calls as sibling fields; the
+            # final answer never lands in this transcript (pane/server only)
             t = str(o.get("type", ""))
             content = str(o.get("content", "") or "").strip()
-            if not content or t in ("USER_INPUT", "EPHEMERAL_MESSAGE"):
+            if t == "PLANNER_RESPONSE":
+                th = " ".join(str(o.get("thinking", "") or "").split())
+                if th:
+                    out.append("💭 " + th[:think_cap])
+                for tc in (o.get("tool_calls") or []):
+                    if isinstance(tc, dict):
+                        name = str(tc.get("name", "?"))
+                        args = tc.get("args") or {}
+                        brief = (args.get("CommandLine") if isinstance(args, dict) else None) \
+                            or (args.get("Arguments") if isinstance(args, dict) else None) \
+                            or json.dumps(args, ensure_ascii=False)
+                        out.append(f"🔧 {name}(" + " ".join(str(brief).split())[:tool_cap] + ")")
+                continue
+            if not content or t in ("USER_INPUT", "EPHEMERAL_MESSAGE", "SYSTEM_MESSAGE"):
                 continue
             if "TOOL" in t:
                 out.append("🔧 " + " ".join(content.split())[:tool_cap])
             elif "THINK" in t or "REASON" in t:
                 out.append("💭 " + " ".join(content.split())[:think_cap])
-            elif t in ("PLANNER_RESPONSE", "ASSISTANT_MESSAGE", "FINAL_RESPONSE"):
+            elif t in ("PLANNER_RESPONSE", "ASSISTANT_MESSAGE", "FINAL_RESPONSE", "GENERIC"):
                 out.append("· " + " ".join(content.split())[:text_cap])
             continue
         msg = o.get("message") or {}
@@ -649,6 +662,16 @@ def main() -> None:
     folder = qq.short_home(cwd)
     title = display_title(info, event.get("agent") or "") or title
     reply = tidy(reply_snippet(event.get("agent") or "", info.get("agent_session") or {}, cwd))
+
+    # a done push with no sniffed reply (agy's answer never hits disk) falls
+    # back to the pane's visible text
+    if status == "done" and not reply:
+        out, err = qq.herdr_run("agent", "read", pane_id, "--lines", "25",
+                                "--format", "text", timeout=10)
+        if not err and out.strip():
+            lines = [l.rstrip() for l in out.splitlines()
+                     if l.strip() and not re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", l)]
+            reply = "\n".join(lines[-30:])
 
     # a blocked push without context is useless — show what the agent is asking
     if status == "blocked":
