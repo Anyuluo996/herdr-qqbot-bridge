@@ -2,11 +2,16 @@
 """herdr plugin daemon: hold the QQ gateway WebSocket and turn QQ replies back
 into agent input.
 
-Receives C2C / group @ messages and keyboard callbacks over the gateway. A quote
-reply to one of the plugin's notifications is submitted to that notification's
-agent via `herdr agent prompt`; a plain message goes to the most recently active
-agent. Files are saved to the plugin's inbox and the agent is handed their path.
-Also serves /agents, /read and /esc.
+Command layer (designed for a multi-agent manager — the plugin takes over as
+little as possible):
+
+  # prefix   plugin commands: #agents #use #start #close #status #read #esc #key #help
+  / prefix   passed through verbatim to the current agent (/model, /clear, ...)
+  plain text submitted to the current agent as a prompt
+
+A quote reply to one of the plugin's notifications routes to that notification's
+agent; a plain message goes to the most recently active agent. Files are saved
+to the plugin's inbox and the agent is handed their path.
 
   bot.py --daemon   run the gateway loop in the foreground
   bot.py --ensure   start the daemon if it isn't already running, then exit
@@ -17,6 +22,7 @@ Also serves /agents, /read and /esc.
 
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -26,15 +32,21 @@ import qq
 import qqws
 
 MAX_BUTTONS = 8
+KEY_RE = re.compile(r"^[\w+-]{1,16}$")  # key names allowed for #key
 
 HELP = (
-    "引用（回复）我的任何通知，文字会发给那个 agent；\n"
-    "直接发消息（不引用）会发给最近活跃的 agent。\n\n"
-    "/agents — 列出 agent 并选择\n"
-    "/read [行数] — 查看 agent 最近的终端输出\n"
-    "/esc — 向 agent 发送 Esc 中断\n"
-    "/help — 本说明\n\n"
-    "发文件/图片给我，会保存后把路径交给 agent。"
+    "【插件指令】# 开头：\n"
+    "#agents — 列出 agent（#use 序号/名称 切换）\n"
+    "#start <类型|配置名> — 启动 agent（别名 #启动）\n"
+    "#close <名称> — 关闭 agent（别名 #停止）\n"
+    "#status — 全部 agent 状态总览\n"
+    "#read [行数] — 看当前 agent 的终端输出\n"
+    "#esc — 发 Esc 中断；#key <键名> — 发按键（down/enter/tab…）\n"
+    "#help — 本说明\n\n"
+    "【透传】其余全部直达当前 agent，插件不接管：\n"
+    "直接发文字 = 当作 prompt 发给它\n"
+    "/xxx = 它自己的斜杠命令（/model /clear /compact…）\n"
+    "引用（回复）我的通知 = 精确路由到那条通知对应的 agent"
 )
 
 GONE = ("not found", "agent_not_found", "pane_not_found", "invalid pane")
@@ -60,6 +72,30 @@ def target_from_agent(agent: dict) -> dict:
         "agent": agent.get("display_agent") or agent.get("agent") or "agent",
         "folder": qq.short_home(agent.get("cwd") or agent.get("foreground_cwd") or ""),
     }
+
+
+def list_agents() -> list:
+    """herdr's agents, most recently active first — the one canonical order
+    shared by #agents, #use and #status."""
+    result, err = qq.herdr_json("agent", "list")
+    if err:
+        return []
+    agents = [a for a in result.get("agents", []) if a.get("pane_id")]
+    agents.sort(key=lambda a: a.get("state_change_seq", 0), reverse=True)
+    return agents
+
+
+def agent_label(agent: dict) -> str:
+    name = agent.get("name") or agent.get("display_agent") or agent.get("agent") or "agent"
+    kind = agent.get("agent") or ""
+    where = qq.short_home(agent.get("cwd") or "")
+    base = os.path.basename(where.rstrip("/\\")) if where else ""
+    parts = [name]
+    if kind and kind != name:
+        parts.append(kind)
+    if base:
+        parts.append(base)
+    return " · ".join(parts)
 
 
 def submit(cfg: dict, pane: str, text: str) -> str:
@@ -109,21 +145,19 @@ def reply(cfg: dict, scene: str, openid: str, content: str, msg_id: str | None =
 def report_failure(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, err: str) -> None:
     """A closed pane is the common case and deserves plain language."""
     if any(m in err.lower() for m in GONE):
-        reply(cfg, scene, openid, f"🚪 {qq.label(target)} 已关闭（pane 不在了）。\n用 /agents 另选。", msg_id)
+        reply(cfg, scene, openid, f"🚪 {qq.label(target)} 已关闭（pane 不在了）。\n#agents 另选，#start 重开。", msg_id)
     else:
         reply(cfg, scene, openid, f"⚠️ {qq.label(target)}: {err}", msg_id)
 
 
-# --- commands ----------------------------------------------------------------
+# --- plugin commands ---------------------------------------------------------
 
 
 def button_label(agent: dict) -> str:
-    """QQ button labels cap at 10 characters, so this is name-only; the status
-    emoji rides along when it fits."""
-    name = agent.get("display_agent") or agent.get("agent") or "agent"
+    """QQ button labels cap at 10 characters."""
+    name = agent.get("name") or agent.get("display_agent") or agent.get("agent") or "agent"
     emoji = qq.STATUS_EMOJI.get(agent.get("agent_status", ""), "")
-    base = f"{emoji}{name}"[:10] if emoji else name[:10]
-    return base or "agent"
+    return (f"{emoji}{name}")[:10] or "agent"
 
 
 def agent_keyboard(agents: list) -> dict:
@@ -139,30 +173,213 @@ def agent_keyboard(agents: list) -> dict:
     return {"content": {"rows": rows}}
 
 
+def agents_text(agents: list) -> str:
+    lines = []
+    for i, a in enumerate(agents, 1):
+        emoji = qq.STATUS_EMOJI.get(a.get("agent_status", ""), "❔")
+        lines.append(f"{i}. {emoji} {agent_label(a)}")
+    return "\n".join(lines)
+
+
+def send_with_keyboard(cfg: dict, scene: str, openid: str, text: str, keyboard: dict,
+                       msg_id: str | None = None, target: dict | None = None) -> None:
+    """#agents panel: the list as text, plus a keyboard in whatever wrap the bot
+    actually renders (config keyboard_mode). QQ inline keyboards are behind a
+    platform review — bots without it get the text list only, so the API answer
+    is not trusted beyond "accepted" and a text menu always rides along."""
+    mode = str(cfg.get("keyboard_mode", "markdown")).lower()
+    if mode in ("", "off", "none"):
+        reply(cfg, scene, openid, text, msg_id, target=target)
+        return
+    if mode == "text":
+        body = {"msg_type": 0, "content": text, "keyboard": keyboard}
+    else:  # markdown
+        body = {"msg_type": 2, "markdown": {"content": text}, "keyboard": keyboard}
+    qq._attach_passive(body, scene, msg_id, None)
+    result, err = qq.api(cfg, "POST", qq._messages_path(scene, openid), body)
+    if err:
+        qq.log(f"bot: keyboard send failed ({err}); falling back to text")
+        if err.split()[0] in qq.MARKDOWN_FALLBACK_CODES and mode == "markdown":
+            body = {"msg_type": 0, "content": text, "keyboard": keyboard}
+            qq._attach_passive(body, scene, msg_id, None)
+            result, err = qq.api(cfg, "POST", qq._messages_path(scene, openid), body)
+        if err:
+            reply(cfg, scene, openid, text, msg_id, target=target)
+            return
+    if target:
+        qq.remember_message(cfg, result or {}, target)
+
+
 def cmd_agents(cfg: dict, scene: str, openid: str, msg_id: str) -> None:
-    result, err = qq.herdr_json("agent", "list")
+    agents = list_agents()
+    if not agents:
+        reply(cfg, scene, openid, "🫙 没有在跑的 agent — 用 #start <类型> 启动，如 #start pi", msg_id)
+        return
+    text = "🤖 agent 列表（#use 序号或名称 选择，点按钮同样有效）：\n" + agents_text(agents)
+    send_with_keyboard(cfg, scene, openid, text, agent_keyboard(agents), msg_id)
+
+
+def pick_agent(agents: list, token: str) -> dict | None:
+    """Match '#use' argument by 1-based index (the #agents order) or name part."""
+    token = token.strip()
+    if token.isdigit():
+        i = int(token) - 1
+        return agents[i] if 0 <= i < len(agents) else None
+    for a in agents:
+        for candidate in (a.get("name"), a.get("display_agent"), a.get("agent")):
+            if candidate and token.lower() in str(candidate).lower():
+                return a
+    return None
+
+
+def cmd_use(cfg: dict, scene: str, openid: str, msg_id: str, args: list) -> None:
+    agents = list_agents()
+    if not agents:
+        reply(cfg, scene, openid, "🫙 没有在跑的 agent — #start 先启动一个", msg_id)
+        return
+    if not args:
+        reply(cfg, scene, openid, "用法：#use <序号|名称>\n" + agents_text(agents), msg_id)
+        return
+    agent = pick_agent(agents, args[0])
+    if not agent:
+        reply(cfg, scene, openid, f"🤷 没找到 {args[0]!r} — #agents 看列表", msg_id)
+        return
+    target = target_from_agent(agent)
+    qq.set_current_target(target)
+    reply(cfg, scene, openid, f"🎯 {qq.label(target)}\n现在直接发消息即可", msg_id, target=target)
+
+
+def cmd_status(cfg: dict, scene: str, openid: str, msg_id: str) -> None:
+    agents = list_agents()
+    if not agents:
+        reply(cfg, scene, openid, "🫙 没有在跑的 agent — #start <类型> 启动", msg_id)
+        return
+    current = qq.current_target().get("pane", "")
+    lines = []
+    for i, a in enumerate(agents, 1):
+        emoji = qq.STATUS_EMOJI.get(a.get("agent_status", ""), "❔")
+        mark = " 👈当前" if a.get("pane_id") == current else ""
+        lines.append(f"{i}. {emoji} {agent_label(a)}{mark}")
+    state = {"done": "完成", "blocked": "等你输入", "working": "干活中",
+             "idle": "空闲", "unknown": "未知"}
+    cur = next((a for a in agents if a.get("pane_id") == current), None)
+    tail = f"\n当前目标状态：{state.get(cur.get('agent_status'), '未知')}" if cur else ""
+    reply(cfg, scene, openid, "📊 " + "；".join(
+        state.get(a.get("agent_status"), "未知") for a in agents) + "\n" + "\n".join(lines) + tail,
+        msg_id)
+
+
+# --- #start ------------------------------------------------------------------
+
+
+def free_pane(cfg: dict) -> tuple[str, str]:
+    """A pane id an agent can start in, or ("", err). Reuses an idle shell pane
+    before splitting a new one off the focused pane."""
+    agents = list_agents()
+    used = {a.get("pane_id") for a in agents}
+    result, err = qq.herdr_json("pane", "list")
+    if err:
+        return "", f"pane list: {err}"
+    panes = result.get("panes", [])
+    for p in panes:
+        if p.get("pane_id") not in used and p.get("agent_status", "unknown") in ("", "unknown"):
+            return p["pane_id"], ""
+    focused = next((p for p in panes if p.get("focused")), panes[0] if panes else None)
+    if not focused:
+        return "", "没有可用 pane，也没有可拆分的焦点 pane"
+    result, err = qq.herdr_json("pane", "split", focused["pane_id"], "--direction", "right")
+    if err:
+        return "", f"pane split: {err}"
+    return (result.get("pane") or {}).get("pane_id", ""), ""
+
+
+def configured_agent(cfg: dict, name: str) -> dict | None:
+    for entry in cfg.get("agent", []):
+        if entry.get("name") == name:
+            return entry
+    return None
+
+
+def cmd_start(cfg: dict, scene: str, openid: str, msg_id: str, args: list) -> None:
+    if not args:
+        names = [e.get("name", "?") for e in cfg.get("agent", [])]
+        reply(cfg, scene, openid,
+              "用法：#start <类型|配置名> [agent参数…]\n"
+              "类型：pi / claude / codex / gemini / opencode / kimi / grok / qwen 等\n"
+              "已配置：" + ("、".join(names) if names else "无（config.toml 里可加 [[agent]]）"),
+              msg_id)
+        return
+    name = args[0]
+    entry = configured_agent(cfg, name)
+    if entry:
+        kind = entry.get("kind") or name
+        agent_name = entry.get("name") or kind
+        extra = [str(a) for a in entry.get("args", [])] + args[1:]
+    else:
+        kind = name
+        agent_name = name
+        extra = args[1:]
+
+    taken = {a.get("name") for a in list_agents()}
+    base = agent_name
+    n = 2
+    while agent_name in taken:
+        agent_name = f"{base}-{n}"
+        n += 1
+
+    pane, err = free_pane(cfg)
     if err:
         reply(cfg, scene, openid, f"⚠️ {err}", msg_id)
         return
-    agents = [a for a in result.get("agents", []) if a.get("pane_id")]
-    if not agents:
-        reply(cfg, scene, openid, "🫙 没有在跑的 agent", msg_id)
+
+    reply(cfg, scene, openid, f"🚀 正在启动 {kind} → pane {pane}（名称 {agent_name}）", msg_id)
+    cmd = ["agent", "start", agent_name, "--kind", kind, "--pane", pane]
+    if extra:
+        cmd += ["--"] + extra
+    _, err = qq.herdr_run(*cmd, timeout=60)
+    if err and "not ready" not in err.lower() and "blocked" not in err.lower():
+        reply(cfg, scene, openid, f"⚠️ 启动失败：{err}", msg_id)
         return
-    agents.sort(key=lambda a: a.get("state_change_seq", 0), reverse=True)
-    shown, extra = agents[:MAX_BUTTONS], len(agents) - MAX_BUTTONS
-    text = "🤖 选择要对话的 agent" + (f"（还有 {extra} 个未列出）" if extra > 0 else "")
-    _, send_err = qq.send_text(cfg, scene, openid, text, msg_id=msg_id)
-    if send_err:
-        qq.log(f"bot: /agents header failed: {send_err}")
+
+    # startup prompts (folder trust, theme pickers) leave the agent blocked —
+    # surface the pane tail so the user can drive it with #key from QQ
+    deadline = time.monotonic() + 15
+    status = ""
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        status = agent_status(pane)
+        if status in ("idle", "working", "blocked"):
+            break
+    if status in ("idle", "working"):
+        target = {"pane": pane, "agent": agent_name, "folder": ""}
+        qq.set_current_target(target)
+        reply(cfg, scene, openid,
+              f"✅ {agent_name}（{kind}）已就绪，已设为当前目标，直接发消息即可", msg_id, target=target)
         return
-    # the keyboard rides on its own message: a markdown body plus a keyboard is
-    # the one combination the platform documents, and plain text + keyboard is
-    # not — so this stays msg_type=0 always
-    body = {"msg_type": 0, "content": text, "keyboard": agent_keyboard(shown)}
-    qq._attach_passive(body, scene, msg_id, None)
-    _, err2 = qq.api(cfg, "POST", qq._messages_path(scene, openid), body)
-    if err2:
-        qq.log(f"bot: /agents keyboard failed: {err2}")
+    out, _ = qq.herdr_run("agent", "read", pane, "--lines", "8", "--format", "text")
+    body = (out.strip() or "（无输出）")[-400:]
+    reply(cfg, scene, openid,
+          f"⏳ {agent_name} 卡在启动提示上（状态 {status or '启动中'}）：\n{body}\n"
+          f"用 #key down / #key enter 这类按键驱动它，#status 看进度", msg_id)
+
+
+def cmd_close(cfg: dict, scene: str, openid: str, msg_id: str, args: list) -> None:
+    agents = list_agents()
+    if not args:
+        reply(cfg, scene, openid, "用法：#close <名称|序号>\n" + (agents_text(agents) or "（无）"), msg_id)
+        return
+    agent = pick_agent(agents, args[0])
+    if not agent:
+        reply(cfg, scene, openid, f"🤷 没找到 {args[0]!r}", msg_id)
+        return
+    pane = agent.get("pane_id", "")
+    _, err = qq.herdr_run("pane", "close", pane, timeout=15)
+    if err:
+        reply(cfg, scene, openid, f"⚠️ 关闭失败：{err}", msg_id)
+        return
+    if qq.current_target().get("pane") == pane:
+        qq.write_state(qq.CURRENT_TARGET, {})
+    reply(cfg, scene, openid, f"🚪 已关闭 {agent_label(agent)}", msg_id)
 
 
 def cmd_read(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, args: list) -> None:
@@ -188,35 +405,63 @@ def cmd_read(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, args
     reply(cfg, scene, openid, content, msg_id, target=target)
 
 
-def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str, target: dict) -> None:
-    parts = text.split()
-    cmd = parts[0].lower()
+def cmd_key(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, args: list) -> None:
+    if not args or not KEY_RE.match(args[0]):
+        reply(cfg, scene, openid, "用法：#key <键名>（down/up/left/right/enter/esc/tab/space/1…）", msg_id)
+        return
+    _, err = qq.herdr_run("agent", "send-keys", target["pane"], args[0])
+    if err:
+        report_failure(cfg, scene, openid, msg_id, target, err)
+        return
+    reply(cfg, scene, openid, f"⌨️ {args[0]} → {qq.label(target)}", msg_id, target=target)
 
-    if cmd in ("/start", "/help"):
+
+def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -> None:
+    parts = text[1:].split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd in ("help", "帮助", "?"):
         reply(cfg, scene, openid, HELP, msg_id)
         return
-
-    if cmd in ("/agents", "/a"):
+    if cmd in ("agents", "a", "列表"):
         cmd_agents(cfg, scene, openid, msg_id)
         return
+    if cmd in ("use", "切换", "选中"):
+        cmd_use(cfg, scene, openid, msg_id, args)
+        return
+    if cmd in ("status", "状态"):
+        cmd_status(cfg, scene, openid, msg_id)
+        return
+    if cmd in ("start", "启动"):
+        cmd_start(cfg, scene, openid, msg_id, args)
+        return
+    if cmd in ("close", "停止", "关闭"):
+        cmd_close(cfg, scene, openid, msg_id, args)
+        return
 
+    target = qq.current_target()
     if not target.get("pane"):
-        reply(cfg, scene, openid, "🤷 还没有选择 agent — 先用 /agents", msg_id)
+        reply(cfg, scene, openid, "🤷 还没有选中 agent — #agents 选择，或 #start 启动", msg_id)
         return
 
-    if cmd == "/read":
-        cmd_read(cfg, scene, openid, msg_id, target, parts)
+    if cmd in ("read", "读"):
+        cmd_read(cfg, scene, openid, msg_id, target, [cmd] + args)
         return
-
-    if cmd == "/esc":
+    if cmd == "esc":
         _, err = qq.herdr_run("agent", "send-keys", target["pane"], "esc")
         if err:
             report_failure(cfg, scene, openid, msg_id, target, err)
             return
-        reply(cfg, scene, openid, f"⎋ 已向 {qq.label(target)} 发送 Esc", msg_id, target=target)
+        reply(cfg, scene, openid, f"⎋ Esc → {qq.label(target)}", msg_id, target=target)
+        return
+    if cmd in ("key", "键"):
+        cmd_key(cfg, scene, openid, msg_id, target, args)
         return
 
-    reply(cfg, scene, openid, f"❓ 未知的命令 {cmd} — 试试 /help", msg_id)
+    reply(cfg, scene, openid, f"❓ 未知指令 #{cmd} — #help 看清单", msg_id)
 
 
 # --- routing -----------------------------------------------------------------
@@ -229,14 +474,14 @@ def resolve(cfg: dict, scene: str, openid: str, msg_id: str, d: dict) -> dict:
     if target:
         return target
     if qq._event_refs(d):
-        reply(cfg, scene, openid, "🕰 那条通知太老，路由不到了 — 引用新一点的通知，或用 /agents 选择", msg_id)
+        reply(cfg, scene, openid, "🕰 那条通知太老，路由不到了 — 引用新一点的通知，或 #use 选择", msg_id)
         return {}
     if not cfg.get("reply_to_latest", True):
-        reply(cfg, scene, openid, "↩️ 请引用我的某条通知来选择 agent", msg_id)
+        reply(cfg, scene, openid, "↩️ 请引用我的某条通知来选择 agent，或 #use 选择", msg_id)
         return {}
     target = qq.current_target()
     if not target.get("pane"):
-        reply(cfg, scene, openid, "🤷 还没有选择 agent — 先用 /agents", msg_id)
+        reply(cfg, scene, openid, "🤷 还没有选中 agent — #agents 选择，#start <类型> 启动", msg_id)
     return target
 
 
@@ -352,11 +597,12 @@ def handle_message(cfg: dict, d: dict) -> None:
     if not text:
         return
 
-    if text.startswith("/"):
-        handle_command(cfg, scene, reply_to, msg_id, text,
-                       qq.target_for_event(d) or qq.current_target())
+    if text.startswith("#"):
+        handle_command(cfg, scene, reply_to, msg_id, text)
         return
 
+    # everything else passes through to the agent: plain text as a prompt,
+    # /slash as the agent's own command — the plugin takes over neither
     target = resolve(cfg, scene, reply_to, msg_id, d)
     if not target.get("pane"):
         return
@@ -367,11 +613,12 @@ def handle_message(cfg: dict, d: dict) -> None:
         return
     qq.set_current_target(target)
     qq.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
-    reply(cfg, scene, reply_to, f"➡️ 已发给 {qq.label(target)}", msg_id, target=target)
+    ack = f"➡️ {text[:40]}{'…' if len(text) > 40 else ''} → {qq.label(target)}"
+    reply(cfg, scene, reply_to, ack, msg_id, target=target)
 
 
 def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
-    """A /agents button press: make that agent the target for plain messages."""
+    """A #agents button press: make that agent the target for plain messages."""
     data = d.get("data") or {}
     pane = (data.get("resolved") or {}).get("button_data") or data.get("button_data") or ""
     scene, reply_to, sender = qq.interaction_ids(d)

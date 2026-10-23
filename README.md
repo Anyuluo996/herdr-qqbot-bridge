@@ -52,9 +52,31 @@ herdr plugin action qqbot.bridge test   # 收到测试消息即通
 
 ## 使用
 
+指令分三层，插件只接管 `#` 前缀，其余全部透传给 agent（herdr 是多 agent 管理器，agent 自己的斜杠命令不该被插件抢走）：
+
+| 输入 | 去向 |
+|---|---|
+| `#agents`（#a） | 列出 agent + 按钮（#use 序号/名称 切换目标） |
+| `#start <类型\|配置名>`（#启动） | 启动 agent：自动找空闲 pane，没有就拆分新 pane；启动卡在首启提示时把终端内容发给你，用 `#key down`/`#key enter` 驱动 |
+| `#close <名称>`（#停止） | 关闭 agent 的 pane |
+| `#status`（#状态） | 全部 agent 状态总览 |
+| `#read [行数]` | 当前 agent 终端输出（超长自动改发 .txt 文件） |
+| `#esc` / `#key <键名>` | 向当前 agent 发按键 |
+| `#help` | 帮助 |
+| 纯文本 | 作为 prompt 发给当前 agent |
+| `/xxx`（/model /clear…） | **原样透传**给当前 agent 自己的 CLI |
+| 引用（回复）某条通知 | 精确路由到那条通知对应的 agent |
+
+`[[agent]]` 配置（仿 cc-connect 命名 agent，可选）：配置后 `#start <名>` 按配置启动：
+
+```toml
+[[agent]]
+name = "pi"
+kind = "pi"
+args = []
+```
+
 - agent 完成时收到推送，**长按/引用回复**那条通知，文字直接进入对应 agent 的终端
-- 直接发消息（不引用）= 发给最近活跃的 agent
-- `/agents` 选人，`/read [行数]` 看输出，`/esc` 中断，`/help` 帮助
 - 发图片/文件给机器人 → 存到 inbox → agent 收到绝对路径
 
 ## 与 Telegram 版的差异（为什么不能照搬）

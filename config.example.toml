@@ -7,6 +7,25 @@ app_secret = "REPLACE_ME"
 # 使用场景: "c2c" 单聊（推荐，限制最松） / "group" 群聊
 scene = "c2c"
 
+# --- 指令分层 -----------------------------------------------------------------
+# # 前缀 = 插件指令（#agents #use #start #close #status #read #esc #key #help）
+# / 前缀与纯文本 = 原样透传给当前 agent，插件不接管（/model /clear 等直达 agent）
+
+# #agents 按钮键盘的发送方式。QQ 内嵌键盘可能需要平台审核权限：
+#   "markdown" = 随 Markdown 消息发（多数 bot 能渲染）
+#   "text"     = 随纯文本消息发
+#   "off"      = 不发键盘，只发文字列表（用 #use 序号 选择）
+keyboard_mode = "markdown"
+
+# --- agent 启动配置（可选，#start 用，仿 cc-connect 的命名 agent） -------------
+# 配置后 #start <name> 按这里启动；未配置时 #start <kind> 直接按类型启动。
+# cwd 由 pane 决定（新拆分 pane 继承焦点 pane 的工作目录）。
+# [[agent]]
+# name = "pi"
+# kind = "pi"     # herdr 支持的类型：pi/claude/codex/gemini/opencode/kimi/grok/qwen…
+# args = []       # 传给 agent CLI 的额外参数，如 ["--model", "xxx"]
+
+
 # 目标会话：留空时，第一条发给机器人的消息会自动绑定（auto_bind = true），
 # 绑定结果存在插件 state 目录 bound_target.json。也可显式填写 openid。
 # openid 不是 QQ 号，是平台分配的逐 bot 唯一串，绑定后可从日志/state 里复制。
