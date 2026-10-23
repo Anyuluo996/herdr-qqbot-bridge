@@ -29,6 +29,7 @@ keyboard_mode = "markdown"
 # [[agent]]
 # name = "agy"
 # kind = "agy"
+# args = ["--mode", "auto"]   # 自动放行工具调用（等效 cc-connect 的 yolo）
 # [agent.env]
 # HTTP_PROXY = "http://127.0.0.1:17890"
 # HTTPS_PROXY = "http://127.0.0.1:17890"

@@ -650,6 +650,14 @@ def main() -> None:
     title = display_title(info, event.get("agent") or "") or title
     reply = tidy(reply_snippet(event.get("agent") or "", info.get("agent_session") or {}, cwd))
 
+    # a blocked push without context is useless — show what the agent is asking
+    if status == "blocked":
+        out, err = qq.herdr_run("agent", "read", pane_id, "--lines", "6",
+                                "--format", "text", timeout=10)
+        if not err and out.strip():
+            tail = " ".join(out.strip().split())[-350:]
+            reply = (reply + "\n\n❓ " + tail) if reply else "❓ " + tail
+
     # a live progress stream that just covered this pane already showed the
     # answer — a second full-size push would dump it all over again
     stream = qq.read_state("stream_state.json", {}).get(pane_id) or {}
