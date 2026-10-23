@@ -427,11 +427,13 @@ def reply_snippet(agent: str, session: dict, cwd: str) -> str:
     return found
 
 
-def transcript_step_lines(agent: str, path: str, offset: int) -> tuple[str, int]:
+def transcript_step_lines(agent: str, path: str, offset: int,
+                          compact: bool = True) -> tuple[str, int]:
     """New transcript entries since byte `offset`, formatted as progress lines:
     💭 thinking, 🔧 tool calls, · interim text. Returns ("", new_offset). The
     transcript is where an agent's intermediate steps actually live — the
-    terminal TUI redraws in place and polls miss them."""
+    terminal TUI redraws in place and polls miss them. compact=True keeps each
+    line short and drops interim text (the answer streams/closes separately)."""
     try:
         with open(path, "rb") as f:
             f.seek(offset)
@@ -443,6 +445,7 @@ def transcript_step_lines(agent: str, path: str, offset: int) -> tuple[str, int]
     lines = qq._decode(data).split("\n")
     remainder = lines.pop()  # partial trailing line unless the read ended on \n
     new_offset = offset + len(data) - len(remainder.encode("utf-8"))
+    think_cap, tool_cap, text_cap = (60, 50, 120) if compact else (120, 100, 120)
     out = []
     for ln in lines:
         if not ln.strip():
@@ -462,18 +465,18 @@ def transcript_step_lines(agent: str, path: str, offset: int) -> tuple[str, int]
             if ct == "thinking":
                 t = " ".join(str(c.get("thinking", "")).split())
                 if t:
-                    out.append("💭 " + t[:120])
+                    out.append("💭 " + t[:think_cap])
             elif ct in ("toolCall", "tool_use"):
                 name = str(c.get("name", "?"))
                 args = c.get("arguments") or c.get("input") or {}
                 brief = (args.get("command") if isinstance(args, dict) else None) \
                     or (args.get("file_path") if isinstance(args, dict) else None) \
                     or json.dumps(args, ensure_ascii=False)
-                out.append(f"🔧 {name} " + " ".join(str(brief).split())[:100])
-            elif ct == "text":
+                out.append(f"🔧 {name}(" + " ".join(str(brief).split())[:tool_cap] + ")")
+            elif ct == "text" and not compact:
                 t = " ".join(str(c.get("text", "")).split())
                 if t:
-                    out.append("· " + t[:120])
+                    out.append("· " + t[:text_cap])
     return ("\n".join(out) + "\n") if out else "", new_offset
 
 
@@ -612,6 +615,13 @@ def main() -> None:
     folder = qq.short_home(cwd)
     title = display_title(info, event.get("agent") or "") or title
     reply = tidy(reply_snippet(event.get("agent") or "", info.get("agent_session") or {}, cwd))
+
+    # a live progress stream that just covered this pane already showed the
+    # answer — a second full-size push would dump it all over again
+    stream = qq.read_state("stream_state.json", {}).get(pane_id) or {}
+    if status == "done" and stream and time.time() - stream.get("ts", 0) < 90:
+        qq.log(f"push suppressed for {pane_id}: progress stream just finished")
+        return
 
     # one line, so a phone's notification preview spends its few lines on the reply
     # rather than on metadata. ✅/❓ already says done/blocked; the word is redundant.

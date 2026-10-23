@@ -251,20 +251,19 @@ def ack_interaction(cfg: dict, interaction_id: str) -> str:
 
 def stream_send(cfg: dict, openid: str, content: str, state: int, index: int,
                 msg_id: str, stream_msg_id: str | None, msg_seq: int,
-                mode: str = "append") -> tuple[str, str]:
+                mode: str = "append") -> tuple[dict | None, str]:
     """One chunk of a c2c streaming message (POST /v2/users/{id}/stream_messages).
     append mode (default): content_raw is glued onto what QQ already shows — send
     only the new lines. replace mode: content_raw is the FULL text and must start
-    with everything already sent (error 40007 otherwise). Returns (stream_msg_id, err)."""
+    with everything already sent (error 40007 otherwise). Returns (full result —
+    id doubles as the next stream_msg_id, ext_info.ref_idx anchors quote routing —
+    err)."""
     body = {"input_mode": mode, "input_state": state, "index": index,
             "content_type": "markdown", "content_raw": content,
             "msg_id": msg_id, "msg_seq": msg_seq}
     if stream_msg_id:
         body["stream_msg_id"] = stream_msg_id
-    result, err = api(cfg, "POST", f"/v2/users/{openid}/stream_messages", body)
-    if err:
-        return (stream_msg_id or ""), err
-    return result.get("id") or (stream_msg_id or ""), ""
+    return api(cfg, "POST", f"/v2/users/{openid}/stream_messages", body)
 
 
 def _decode(data: bytes) -> str:

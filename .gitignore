@@ -15,4 +15,5 @@ bot_offset.json
 bot.lock
 bot.pid
 bot.stop
+stream_state.json
 inbox/

@@ -104,7 +104,11 @@ stale_drop_minutes = 15
 stream_progress = true
 
 # 进度流轮询间隔（秒）。QQ 流式接口限频，别低于 3。
-stream_interval_seconds = 8
+stream_interval_seconds = 4
+
+# 步骤行折叠显示：💭 思维链截 60 字、🔧 工具调用只留名字+参数前 50 字、
+# 中间文本不显示（完整回复在收尾片/完成推送里）。false = 完整步骤。
+stream_compact = true
 
 # 单条进度流最长持续时间（秒），超时自动收尾。
 stream_max_seconds = 600

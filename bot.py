@@ -550,26 +550,35 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
     index = 0
     stream_id = None
     seq = qq.next_seq(msg_id)
+    compact = bool(cfg.get("stream_compact", True))
+
+    def touch(done: bool = False) -> None:
+        # heartbeat for notify's push suppression: a fresh ts means this stream
+        # is (or just was) covering the pane's answer
+        qq.write_state("stream_state.json", {pane: {"ts": time.time(), "done": done}})
 
     def chunk(state: int, text: str) -> bool:
         nonlocal stream_id, index
         if not text:
             return True
-        sid, err = qq.stream_send(cfg, openid, text, state, index, msg_id, stream_id, seq)
+        result, err = qq.stream_send(cfg, openid, text, state, index, msg_id, stream_id, seq)
         if err:
             qq.log(f"stream: chunk {index} ({len(text)} chars) failed: {err}")
             return False
         qq.log(f"stream: chunk {index} sent ({len(text)} chars, state {state})")
-        stream_id, index = sid, index + 1
+        stream_id = result.get("id") or stream_id
+        index += 1
+        touch()
         return True
 
+    touch()
     if not chunk(1, f"⏳ {label}\n"):
         return
     while time.monotonic() < deadline:
         status = agent_status(pane)
         fresh = ""
         if tpath:
-            fresh, offset = notify.transcript_step_lines(kind, tpath, offset)
+            fresh, offset = notify.transcript_step_lines(kind, tpath, offset, compact=compact)
         else:
             out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
             if not err:
@@ -584,8 +593,18 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                     fresh = "\n".join(new_lines) + "\n"
         if status not in ("working", "unknown", ""):
             final = notify.reply_snippet_of_pane(pane)
-            tail = (fresh + "✅ " + final) if final else (fresh + "（已完成，详见完成推送）")
-            chunk(10, tail[:1200])
+            tail = (fresh + "✅ " + final) if final else (fresh + "（已完成）")
+            # the stream message is the answer now — the completion push is
+            # suppressed for this pane, so this chunk carries the routing anchor
+            result, ferr = qq.stream_send(cfg, openid, tail[:1200], 10, index, msg_id,
+                                          stream_id, seq)
+            if ferr:
+                qq.log(f"stream: final chunk failed: {ferr}")
+            else:
+                qq.log(f"stream: final chunk sent ({len(tail)} chars)")
+                qq.remember_message(cfg, result or {},
+                                    {"pane": pane, "agent": agent, "folder": ""})
+            touch(done=True)
             return
         if not chunk(1, fresh):
             return
