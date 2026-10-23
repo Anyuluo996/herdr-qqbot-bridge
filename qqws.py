@@ -63,7 +63,9 @@ class WS:
         want = base64.b64encode(hashlib.sha1((key + _GUID).encode()).digest()).decode()
         if accept != want:
             raise HandshakeError("bad Sec-WebSocket-Accept")
-        self.buf = b""
+        # keep whatever bytes rode in past the header terminator — on loopback
+        # the first frames often coalesce with the 101 response, and clearing
+        # buf here silently eats them
 
     def _read_until(self, marker: bytes, timeout: float) -> bytes:
         self.sock.settimeout(timeout)

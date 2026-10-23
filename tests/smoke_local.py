@@ -226,8 +226,6 @@ def test_websocket():
         ok = check("ws: client loop crashed", False, repr(e))
     finally:
         ws.close()
-    finally:
-        ws.close()
     t.join(timeout=5)
     return ok and all(results)
 
