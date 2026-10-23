@@ -250,11 +250,13 @@ def ack_interaction(cfg: dict, interaction_id: str) -> str:
 
 
 def stream_send(cfg: dict, openid: str, content: str, state: int, index: int,
-                msg_id: str, stream_msg_id: str | None, msg_seq: int) -> tuple[str, str]:
+                msg_id: str, stream_msg_id: str | None, msg_seq: int,
+                mode: str = "append") -> tuple[str, str]:
     """One chunk of a c2c streaming message (POST /v2/users/{id}/stream_messages).
-    replace mode: content_raw is the FULL text and must start with everything
-    already sent (error 40007 otherwise). Returns (stream_msg_id, err)."""
-    body = {"input_mode": "replace", "input_state": state, "index": index,
+    append mode (default): content_raw is glued onto what QQ already shows — send
+    only the new lines. replace mode: content_raw is the FULL text and must start
+    with everything already sent (error 40007 otherwise). Returns (stream_msg_id, err)."""
+    body = {"input_mode": mode, "input_state": state, "index": index,
             "content_type": "markdown", "content_raw": content,
             "msg_id": msg_id, "msg_seq": msg_seq}
     if stream_msg_id:

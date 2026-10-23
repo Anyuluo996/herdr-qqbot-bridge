@@ -517,12 +517,12 @@ def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -
 
 
 def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) -> None:
-    """Grow one QQ streaming message with new terminal lines while the agent
-    works, then finish it with the reply. Replace mode requires the accumulated
-    text's prefix to never change — this only ever appends."""
-    interval = max(3, int(cfg.get("stream_interval_seconds", 8)))
+    """Live progress in one QQ streaming message: every poll appends only the
+    terminal lines that appeared since the last one (append mode — no prefix
+    constraints), and the final chunk carries the transcript reply. A quiet
+    agent (LLM thinking) simply has nothing to append until output flows."""
+    interval = max(3, int(cfg.get("stream_interval_seconds", 5)))
     deadline = time.monotonic() + int(cfg.get("stream_max_seconds", 600))
-    sent = f"⏳ {label}\n"
     seen: set[str] = set()
     index = 0
     stream_id = None
@@ -530,36 +530,42 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
 
     def chunk(state: int, text: str) -> bool:
         nonlocal stream_id, index
+        if not text:
+            return True
         sid, err = qq.stream_send(cfg, openid, text, state, index, msg_id, stream_id, seq)
         if err:
-            qq.log(f"stream: chunk {index} failed: {err}")
+            qq.log(f"stream: chunk {index} ({len(text)} chars) failed: {err}")
             return False
+        qq.log(f"stream: chunk {index} sent ({len(text)} chars, state {state})")
         stream_id, index = sid, index + 1
         return True
 
-    if not chunk(1, sent):
+    time.sleep(2)  # let the first output land before opening the stream
+    if not chunk(1, f"⏳ {label}\n"):
         return
     while time.monotonic() < deadline:
-        time.sleep(interval)
         status = agent_status(pane)
         out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
+        fresh = ""
         if not err:
+            new_lines = []
             for ln in out.splitlines():
                 ln = ln.rstrip()
                 if not ln or ln in seen or SPINNER_RE.search(ln):
                     continue
                 seen.add(ln)
-                sent += ln + "\n"
+                new_lines.append(ln)
+            if new_lines:
+                fresh = "\n".join(new_lines) + "\n"
         if status not in ("working", "unknown", ""):
             import notify  # lazy: transcript sniffing is only needed at the end
-            final = notify.reply_snippet_of_pane(pane) or "（已完成，详见完成推送）"
-            chunk(10, (sent + "✅ " + final)[:2000])
+            final = notify.reply_snippet_of_pane(pane)
+            tail = (fresh + "✅ " + final) if final else (fresh + "（已完成，详见完成推送）")
+            chunk(10, tail[:1200])
             return
-        if len(sent) > 1800:
-            chunk(10, sent + "…\n（进度流到此收起，完成后仍有总结推送）")
+        if not chunk(1, fresh):
             return
-        if not chunk(1, sent):
-            return
+        time.sleep(interval)
 
 
 # --- routing -----------------------------------------------------------------
