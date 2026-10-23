@@ -556,6 +556,8 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         a0 = info.get("agent", {})
         agent = a0.get("display_agent") or a0.get("agent") or ""
 
+    started_ts = time.time()
+
     def resolve_transcript() -> tuple[str, str]:
         info, err = qq.herdr_json("agent", "get", pane, timeout=10)
         if err:
@@ -563,8 +565,10 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         a = info.get("agent", {})
         k = a.get("agent") or ""
         c = a.get("cwd") or a.get("foreground_cwd") or ""
+        # since=stream start (minus mtime slack): a neighbour pane's older
+        # transcript must never pass as this one's — its answer would too
         p = (notify.session_file(k, a.get("agent_session") or {})
-             or notify.session_file_fallback(k, c))
+             or notify.session_file_fallback(k, c, since=started_ts - 60))
         return (p if p and os.path.isfile(p) else ""), k
 
     # a session created by this very prompt doesn't exist yet — resolve_transcript
@@ -768,6 +772,16 @@ def resolve(cfg: dict, scene: str, openid: str, msg_id: str, d: dict) -> dict:
         reply(cfg, scene, openid, "↩️ 请引用我的某条通知来选择 agent，或 #use 选择", msg_id)
         return {}
     target = qq.current_target()
+    if target.get("pane") and not any(a.get("pane_id") == target["pane"]
+                                      for a in list_agents()):
+        # remembered pane was closed since — prompting it only yields
+        # agent_not_found; fall back to the most recently active one
+        qq.log(f"bot: stale current target {target['pane']}, falling back")
+        qq.write_state(qq.CURRENT_TARGET, {})
+        target = {}
+        agents = list_agents()
+        if agents:
+            target = target_from_agent(agents[0])
     if not target.get("pane"):
         reply(cfg, scene, openid, "🤷 还没有选中 agent — #agents 选择，#start <类型> 启动", msg_id)
     return target
@@ -882,7 +896,9 @@ def capture_slash_reply(cfg: dict, scene: str, reply_to: str, msg_id: str,
                 break
     body = "\n".join(parts).strip()
     if not body:
+        qq.log(f"slash capture: nothing new on {pane} for {cmd[:20]}")
         return
+    qq.log(f"slash capture: pushing {len(body)} chars for {cmd[:20]}")
     reply(cfg, scene, reply_to, f"⌨️ {cmd[:30]}\n{body[-1200:]}", msg_id, target=target)
 
 

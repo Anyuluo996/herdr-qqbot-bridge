@@ -53,15 +53,18 @@ def session_file(agent: str, session: dict) -> str:
     return ""
 
 
-def session_file_fallback(agent: str, cwd: str) -> str:
+def session_file_fallback(agent: str, cwd: str, since: float = 0.0) -> str:
     """herdr reports no agent_session for some launches; find the newest
-    transcript belonging to this cwd from the agent's own storage. The recency
-    window keeps us honest when several agents share one directory."""
+    transcript belonging to this cwd from the agent's own storage. Same-kind
+    panes share one storage root and project dirs don't always match the pane
+    cwd (omp lands in -tmp), so recency decides — `since` (unix ts) bounds how
+    old the file may be, otherwise a neighbour pane's stale transcript gets
+    mistaken for ours and its last answer passes as ours."""
     if not cwd:
         return ""
     home = os.path.expanduser("~")
     now = time.time()
-    fresh = 30 * 60
+    fresh = 10 * 60  # a live session is written to within minutes
     if agent == "claude":
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # C:\Users\anyul → C--Users-anyul
         hits = glob.glob(os.path.join(home, ".claude", "projects", slug, "*.jsonl"))
@@ -79,7 +82,8 @@ def session_file_fallback(agent: str, cwd: str) -> str:
                                       ".system_generated", "logs", "transcript.jsonl"))
     else:
         return ""
-    hits = [h for h in hits if now - os.path.getmtime(h) < fresh]
+    hits = [h for h in hits
+            if now - os.path.getmtime(h) < fresh and os.path.getmtime(h) >= since]
     return max(hits, key=os.path.getmtime) if hits else ""
 
 
