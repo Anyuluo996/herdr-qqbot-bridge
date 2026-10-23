@@ -1012,8 +1012,9 @@ def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
         return
     if pane.startswith("paneopt:"):
         # an option button from a blocked push: navigate the pane's selector to
-        # that digit (read live, the highlight may have moved) and press Enter
-        _, optpane, digit = pane.split(":", 2)
+        # that digit (read live, the highlight may have moved) and press Enter.
+        # pane ids contain a colon (w4:pH) — strip only the trailing digit
+        optpane, digit = pane[len("paneopt:"):].rsplit(":", 1)
         opts, cur = qq.pane_options(optpane)
         cur = cur or (int(opts[0][0]) if opts else 0)
         target_digit = int(digit)
