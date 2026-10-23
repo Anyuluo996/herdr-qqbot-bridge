@@ -65,9 +65,10 @@ def session_file_fallback(agent: str, cwd: str) -> str:
     if agent == "claude":
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # C:\Users\anyul → C--Users-anyul
         hits = glob.glob(os.path.join(home, ".claude", "projects", slug, "*.jsonl"))
-    elif agent == "pi":
+    elif agent in ("pi", "omp"):  # omp is a pi-family CLI: same sessions layout
+        root = ".omp" if agent == "omp" else ".pi"
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # sessions/--C--Users-anyul--/
-        hits = [h for h in glob.glob(os.path.join(home, ".pi", "agent", "sessions", "*", "*.jsonl"))
+        hits = [h for h in glob.glob(os.path.join(home, root, "agent", "sessions", "*", "*.jsonl"))
                 if slug in os.path.basename(os.path.dirname(h))]
     else:
         return ""
