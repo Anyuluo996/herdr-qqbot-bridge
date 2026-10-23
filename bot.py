@@ -716,7 +716,7 @@ def handle_message(cfg: dict, d: dict) -> None:
         # live progress: one QQ streaming message grows with the terminal while
         # the agent works (c2c only — group messages don't support streaming)
         threading.Thread(target=stream_progress, daemon=True,
-                         args=(cfg, openid, target["pane"], msg_id, qq.label(target))).start()
+                         args=(cfg, reply_to, target["pane"], msg_id, qq.label(target))).start()
 
 
 def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
@@ -726,9 +726,12 @@ def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
     scene, reply_to, sender = qq.interaction_ids(d)
     qq.log(f"bot: interaction from {sender[:12]}… scene={scene} data={pane[:24]!r}")
     # the platform requires an explicit ack for every callback — without it the
-    # client shows 第三方请求失败, even when our reply message gets through
-    if event_id:
-        err = qq.ack_interaction(cfg, event_id)
+    # client shows 第三方请求失败. The ack id lives inside the payload (d.id),
+    # NOT in the gateway frame's top-level id (that one is for event_id replies)
+    # — per tencent-connect/qqbot-nodejs, which casts d itself to InteractionEvent.
+    ack_id = d.get("id") or event_id
+    if ack_id:
+        err = qq.ack_interaction(cfg, ack_id)
         if err:
             qq.log(f"bot: interaction ack failed: {err}")
     if scene != qq.scene_cfg(cfg):

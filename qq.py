@@ -265,6 +265,17 @@ def stream_send(cfg: dict, openid: str, content: str, state: int, index: int,
     return result.get("id") or (stream_msg_id or ""), ""
 
 
+def _decode(data: bytes) -> str:
+    """Windows cmd.exe emits the ANSI codepage (GBK on Chinese systems); agent
+    CLIs emit UTF-8. Try UTF-8 first, fall back to GBK, never raise."""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def run_shell(cfg: dict, command: str, cwd: str = "",
               timeout: int = 30) -> tuple[str, str]:
     """Execute a shell command locally -> (combined output tail, err). Only ever
@@ -277,7 +288,7 @@ def run_shell(cfg: dict, command: str, cwd: str = "",
         return "", f"超时（>{timeout}s，已终止）"
     except Exception as e:
         return "", repr(e)
-    text = (out.stdout.decode(errors="replace") + out.stderr.decode(errors="replace")).strip()
+    text = (_decode(out.stdout) + _decode(out.stderr)).strip()
     if out.returncode != 0:
         text += f"\n（exit {out.returncode}）"
     return text, ""
