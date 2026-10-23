@@ -24,6 +24,14 @@ keyboard_mode = "markdown"
 # name = "pi"
 # kind = "pi"     # herdr 支持的类型：pi/claude/codex/gemini/opencode/kimi/grok/qwen…
 # args = []       # 传给 agent CLI 的额外参数，如 ["--model", "xxx"]
+# env = {}        # 启动前注入 pane shell 的环境变量（agy 需要代理才能连 Google）：
+#
+# [[agent]]
+# name = "agy"
+# kind = "agy"
+# [agent.env]
+# HTTP_PROXY = "http://127.0.0.1:17890"
+# HTTPS_PROXY = "http://127.0.0.1:17890"
 
 
 # 目标会话：留空时，第一条发给机器人的消息会自动绑定（auto_bind = true），

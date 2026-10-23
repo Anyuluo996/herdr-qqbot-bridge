@@ -70,6 +70,9 @@ def session_file_fallback(agent: str, cwd: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # sessions/--C--Users-anyul--/
         hits = [h for h in glob.glob(os.path.join(home, root, "agent", "sessions", "*", "*.jsonl"))
                 if slug in os.path.basename(os.path.dirname(h))]
+    elif agent == "agy":  # brain/<uuid>/.system_generated/logs/transcript.jsonl
+        hits = glob.glob(os.path.join(home, ".gemini", "antigravity-cli", "brain", "*",
+                                      ".system_generated", "logs", "transcript.jsonl"))
     else:
         return ""
     hits = [h for h in hits if now - os.path.getmtime(h) < fresh]
@@ -409,6 +412,20 @@ def resolve_session(agent: str, session: dict, cwd: str, title: str) -> str:
     return value
 
 
+def last_reply_agy(path: str) -> str:
+    """agy transcript: the reply is the last PLANNER_RESPONSE (or final) entry."""
+    for ln in reversed(_tail_lines(path)):
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        if o.get("type") in ("PLANNER_RESPONSE", "FINAL_RESPONSE", "ASSISTANT_MESSAGE"):
+            t = str(o.get("content", "") or "").strip()
+            if t:
+                return t
+    return ""
+
+
 def reply_snippet(agent: str, session: dict, cwd: str) -> str:
     if agent == "grok":
         return last_reply_grok(cwd)
@@ -418,6 +435,9 @@ def reply_snippet(agent: str, session: dict, cwd: str) -> str:
         return last_reply_hermes(session.get("value", ""))
     if agent == "opencode":
         return last_reply_opencode(resolve_session(agent, session, cwd, ""))
+    if agent == "agy":
+        sf = session_file(agent, session) or session_file_fallback(agent, cwd)
+        return last_reply_agy(sf) if sf else ""
     sf = session_file(agent, session) or session_file_fallback(agent, cwd)
     if not sf:
         return ""
@@ -453,6 +473,20 @@ def transcript_step_lines(agent: str, path: str, offset: int,
         try:
             o = json.loads(ln)
         except Exception:
+            continue
+        if agent == "agy":
+            # flat entries: type USER_INPUT/EPHEMERAL_MESSAGE/PLANNER_RESPONSE/
+            # TOOL_*/…, content as plain text
+            t = str(o.get("type", ""))
+            content = str(o.get("content", "") or "").strip()
+            if not content or t in ("USER_INPUT", "EPHEMERAL_MESSAGE"):
+                continue
+            if "TOOL" in t:
+                out.append("🔧 " + " ".join(content.split())[:tool_cap])
+            elif "THINK" in t or "REASON" in t:
+                out.append("💭 " + " ".join(content.split())[:think_cap])
+            elif t in ("PLANNER_RESPONSE", "ASSISTANT_MESSAGE", "FINAL_RESPONSE"):
+                out.append("· " + " ".join(content.split())[:text_cap])
             continue
         msg = o.get("message") or {}
         content = msg.get("content")

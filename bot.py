@@ -353,6 +353,23 @@ def cmd_start(cfg: dict, scene: str, openid: str, msg_id: str, args: list) -> No
         reply(cfg, scene, openid, f"⚠️ {err}", msg_id)
         return
 
+    # [[agent]].env: the pane's shell gets the vars before the agent starts —
+    # how agy gets its proxy (the pane shell persists them for the session)
+    env = {str(k): str(v) for k, v in ((entry or {}).get("env") or {}).items()}
+    if env:
+        pinfo, perr = qq.herdr_json("pane", "get", pane, timeout=10)
+        title = str((pinfo.get("pane") or pinfo or {}).get("terminal_title", "")).lower() \
+            if not perr else ""
+        if "pwsh" in title or "powershell" in title or "cmd" in title:
+            line = "; ".join(f"$env:{k}='{v}'" for k, v in env.items())
+        else:
+            line = " ".join(f"export {k}='{v}'" for k, v in env.items())
+        _, env_err = qq.herdr_run("pane", "run", pane, line, timeout=15)
+        if env_err:
+            reply(cfg, scene, openid, f"⚠️ 环境变量注入失败：{env_err}", msg_id)
+            return
+        time.sleep(1)
+
     reply(cfg, scene, openid, f"🚀 正在启动 {kind} → pane {pane}（名称 {agent_name}）", msg_id)
     cmd = ["agent", "start", agent_name, "--kind", kind, "--pane", pane]
     if extra:
