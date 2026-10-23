@@ -254,13 +254,14 @@ def stale(d: dict, cfg: dict) -> bool:
 
 
 def authorized(cfg: dict, scene: str, reply_to: str, sender: str) -> str:
-    """Reason this message may NOT drive agents, or "" when it may."""
+    """Reason this message may NOT drive agents, or "" when it may. "no bound
+    target" is special: the caller may auto-bind the sender (see handle_message)."""
     allowed = [str(u) for u in cfg.get("allow_users", [])]
     if allowed and sender not in allowed:
         return "sender not allowlisted"
     bound_scene, bound = qq.push_target(cfg)
     if not bound:
-        return "" if cfg.get("auto_bind", True) else "no bound target"
+        return "no bound target"
     if scene != bound_scene:
         return "scene mismatch"
     if reply_to != bound:
@@ -325,14 +326,16 @@ def handle_message(cfg: dict, d: dict) -> None:
     if scene != qq.scene_cfg(cfg):
         qq.log(f"bot: dropping {scene} message (scene is {qq.scene_cfg(cfg)})")
         return
-    reason = authorized(cfg, scene, reply_to, sender)
     msg_id = d.get("id") or ""
+    text = qq.strip_mentions(d.get("content") or "")
+    qq.log(f"bot: message from {sender[:12]}… scene={scene} text={text[:60]!r}")
+    reason = authorized(cfg, scene, reply_to, sender)
     if reason == "no bound target":
-        if scene == qq.scene_cfg(cfg) and reply_to:
-            qq.bind_target(cfg, scene, reply_to)
-            reply(cfg, scene, reply_to, "✅ 已绑定当前会话，开始使用吧。\n\n" + HELP, msg_id)
-        else:
+        if not cfg.get("auto_bind", True):
             qq.log("bot: message ignored (no bound target, auto_bind off)")
+            return
+        qq.bind_target(cfg, scene, reply_to)
+        reply(cfg, scene, reply_to, "✅ 已绑定当前会话，开始使用吧。\n\n" + HELP, msg_id)
         return
     if reason:
         qq.log(f"bot: ignoring message ({reason}) from {sender[:12]}…")
@@ -341,7 +344,6 @@ def handle_message(cfg: dict, d: dict) -> None:
         qq.log(f"bot: dropping stale message {msg_id[:16]}…")
         return
 
-    text = qq.strip_mentions(d.get("content") or "")
     if (d.get("attachments") or []):
         target = resolve(cfg, scene, reply_to, msg_id, d)
         if target.get("pane"):
@@ -373,6 +375,7 @@ def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
     data = d.get("data") or {}
     pane = (data.get("resolved") or {}).get("button_data") or data.get("button_data") or ""
     scene, reply_to, sender = qq.interaction_ids(d)
+    qq.log(f"bot: interaction from {sender[:12]}… scene={scene} data={pane[:24]!r}")
     if scene != qq.scene_cfg(cfg):
         return
     reason = authorized(cfg, scene, reply_to, sender)
