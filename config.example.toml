@@ -29,7 +29,9 @@ keyboard_mode = "markdown"
 # [[agent]]
 # name = "agy"
 # kind = "agy"
-# args = ["--mode", "auto"]   # 自动放行工具调用（等效 cc-connect 的 yolo）
+# args = ["--dangerously-skip-permissions"]   # 全自动放行（yolo）。注意 --mode auto
+#                                             # 交互模式要求 plan model，未配置会报
+#                                             # "plan model not specified"
 # [agent.env]
 # HTTP_PROXY = "http://127.0.0.1:17890"
 # HTTPS_PROXY = "http://127.0.0.1:17890"
