@@ -222,6 +222,10 @@ def test_websocket():
         except qqws.Closed:
             closed = True
         ok &= check("ws: close frame raises Closed", closed)
+    except Exception as e:  # noqa: BLE001 — a dead server shows up as a timeout here
+        ok = check("ws: client loop crashed", False, repr(e))
+    finally:
+        ws.close()
     finally:
         ws.close()
     t.join(timeout=5)
