@@ -68,8 +68,12 @@ def session_file_fallback(agent: str, cwd: str) -> str:
     elif agent in ("pi", "omp"):  # omp is a pi-family CLI: same sessions layout
         root = ".omp" if agent == "omp" else ".pi"
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # sessions/--C--Users-anyul--/
-        hits = [h for h in glob.glob(os.path.join(home, root, "agent", "sessions", "*", "*.jsonl"))
-                if slug in os.path.basename(os.path.dirname(h))]
+        all_hits = glob.glob(os.path.join(home, root, "agent", "sessions", "*", "*.jsonl"))
+        strict = [h for h in all_hits
+                  if slug in os.path.basename(os.path.dirname(h))]
+        # a pi-family fork may resolve its project dir differently from the pane
+        # cwd (omp runs in /tmp while herdr reports ~) — recency picks the live one
+        hits = strict or all_hits
     elif agent == "agy":  # brain/<uuid>/.system_generated/logs/transcript.jsonl
         hits = glob.glob(os.path.join(home, ".gemini", "antigravity-cli", "brain", "*",
                                       ".system_generated", "logs", "transcript.jsonl"))

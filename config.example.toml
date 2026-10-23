@@ -29,9 +29,9 @@ keyboard_mode = "markdown"
 # [[agent]]
 # name = "agy"
 # kind = "agy"
-# args = ["--dangerously-skip-permissions"]   # 全自动放行（yolo）。注意 --mode auto
-#                                             # 交互模式要求 plan model，未配置会报
-#                                             # "plan model not specified"
+# args = ["--model", "gemini-3.8-flash-high",   # 交互模式必须显式给 --model，
+#         "--dangerously-skip-permissions"]     # 否则报 "plan model not specified"；
+#                                               # 可选值见 `agy models`（yolo 全自动放行）
 # [agent.env]
 # HTTP_PROXY = "http://127.0.0.1:17890"
 # HTTPS_PROXY = "http://127.0.0.1:17890"
@@ -127,6 +127,10 @@ stream_max_seconds = 600
 # 进度流消息的总字符预算（步骤 + 收尾回复）。回复超出预算的部分自动切成
 # 后续普通消息补发，保证长回复不截断。
 stream_total_chars = 3000
+
+# 无状态事件的 agent（omp 等分支，herdr 检测不到 working/idle）判定完成的
+# 静默秒数：转录/终端持续这么久没有新内容即认为完成。长命令多的场景可调大。
+stream_quiet_seconds = 25
 
 # --- 本机命令执行（#sh） ------------------------------------------------------
 

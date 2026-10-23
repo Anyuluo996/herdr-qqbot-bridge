@@ -34,6 +34,10 @@ import qqws
 
 MAX_BUTTONS = 8
 KEY_RE = re.compile(r"^[\w+-]{1,16}$")  # key names allowed for #key
+# TUI redraw noise the pane tail must never stream: braille spinner frames and
+# box-drawing/block/geometric glyphs (tables, splash art, progress bars). Real
+# answer text doesn't contain these code points.
+SPINNER_RE = re.compile(r"[\u2800-\u28FF\u2500-\u25FF]")
 
 HELP = (
     "**插件指令**（# 开头）\n"
@@ -549,8 +553,8 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
     agent = ""
     info, err = qq.herdr_json("agent", "get", pane, timeout=10)
     if not err:
-        agent = info.get("agent", {}).get("display_agent") \
-            or info.get("agent", {}).get("agent") or ""
+        a0 = info.get("agent", {})
+        agent = a0.get("display_agent") or a0.get("agent") or ""
 
     def resolve_transcript() -> tuple[str, str]:
         info, err = qq.herdr_json("agent", "get", pane, timeout=10)
@@ -602,18 +606,82 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         touch()
         return True
 
+    def grab_final() -> str:
+        final = notify.reply_snippet_of_pane(pane)
+        if not final:
+            out, perr = qq.herdr_run("agent", "read", pane, "--lines", "25",
+                                     "--format", "text", timeout=10)
+            if not perr and out.strip():
+                lines = [l.rstrip() for l in out.splitlines()
+                         if l.strip() and not SPINNER_RE.search(l)]
+                final = "\n".join(lines[-30:])
+        return final.strip()
+
+    def close_out(marker: str) -> None:
+        # the stream message carries the answer (the completion push is
+        # suppressed for this pane), but streams have a total length budget —
+        # whatever doesn't fit goes out as regular follow-up messages so a
+        # long reply is never silently truncated
+        final = grab_final()
+        if not final:
+            final = "仍在运行 — 稍后 #read 看输出"
+        head = marker + final
+        cap = max(600, int(cfg.get("stream_total_chars", 3000)))
+        fits = max(200, cap - sent_chars)
+        if len(head) <= fits:
+            result, ferr = qq.stream_send(cfg, openid, head, 10, index, msg_id,
+                                          stream_id, seq)
+            if not ferr:
+                qq.log(f"stream: final chunk sent ({len(head)} chars)")
+                qq.remember_message(cfg, result or {},
+                                    {"pane": pane, "agent": agent, "folder": ""})
+            else:
+                qq.log(f"stream: final chunk failed: {ferr}")
+            touch(done=True)
+            return
+        cut = head.rfind("\n", 0, fits)
+        if cut < int(fits * 0.5):  # no decent line boundary — hard cut
+            cut = fits
+        stream_part = head[:cut].rstrip() + "\n\n（长回复未完，接下条）"
+        result, ferr = qq.stream_send(cfg, openid, stream_part, 10, index, msg_id,
+                                      stream_id, seq)
+        if ferr:
+            qq.log(f"stream: final chunk failed: {ferr}")
+        else:
+            qq.log(f"stream: final chunk sent ({len(stream_part)} chars), "
+                   f"{len(head) - cut} chars follow as messages")
+            qq.remember_message(cfg, result or {},
+                                {"pane": pane, "agent": agent, "folder": ""})
+        touch(done=True)
+        rest = head[cut:].lstrip()
+        for piece in qq.split_markdown(rest, int(cfg.get("chunk_chars", 1000))):
+            res, perr = qq.send_text(cfg, "c2c", openid, piece)
+            if not perr:
+                qq.remember_message(cfg, res or {},
+                                    {"pane": pane, "agent": agent, "folder": ""})
+
     touch()
     if not chunk(1, f"⏳ {label}\n"):
         return
     saw_working = False
     grace = time.monotonic() + 30  # prompt injection registers late on some CLIs
+    quiet_secs = max(10, int(cfg.get("stream_quiet_seconds", 25)))
+    no_activity_deadline = time.monotonic() + max(60, 2 * quiet_secs)
+    last_activity = time.monotonic()
+    saw_activity = False
     while time.monotonic() < deadline:
         status = agent_status(pane)
         if status == "working":
             saw_working = True
-        finished = ((saw_working and status not in ("working", "unknown", ""))
-                    or (not saw_working and time.monotonic() > grace
-                        and status != "working"))
+        if saw_working:
+            # herdr tracks this kind: the working->idle event is the finish line
+            finished = status not in ("working", "unknown", "")
+        else:
+            # omp-style forks never leave "idle" — done means the transcript or
+            # pane has gone quiet (or nothing ever showed up at all)
+            finished = ((saw_activity and time.monotonic() - last_activity > quiet_secs)
+                        or (not saw_activity
+                            and time.monotonic() > no_activity_deadline))
         fresh = ""
         if not tpath:
             tpath, kind = resolve_transcript()
@@ -622,7 +690,12 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                 seen.clear()
                 qq.log(f"stream: source switched to transcript ({kind})")
         if tpath:
-            fresh, offset = notify.transcript_step_lines(kind, tpath, offset, compact=compact)
+            fresh, new_offset = notify.transcript_step_lines(kind, tpath, offset,
+                                                             compact=compact)
+            if new_offset != offset:  # growth counts even when compact hides it
+                offset = new_offset
+                last_activity = time.monotonic()
+                saw_activity = True
         else:
             out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
             if not err:
@@ -635,57 +708,22 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                     new_lines.append(ln)
                 if new_lines:
                     fresh = "\n".join(new_lines) + "\n"
+                    last_activity = time.monotonic()
+                    saw_activity = True
         if finished:
-            # the stream message carries the answer (the completion push is
-            # suppressed for this pane), but streams have a total length budget —
-            # whatever doesn't fit goes out as regular follow-up messages so a
-            # long reply is never silently truncated
-            final = notify.reply_snippet_of_pane(pane)
-            if not final:
-                out, perr = qq.herdr_run("agent", "read", pane, "--lines", "25",
-                                         "--format", "text", timeout=10)
-                if not perr and out.strip():
-                    lines = [l.rstrip() for l in out.splitlines()
-                             if l.strip() and not SPINNER_RE.search(l)]
-                    final = "\n".join(lines[-30:])
-            head = "✅ " + final
-            cap = max(600, int(cfg.get("stream_total_chars", 3000)))
-            fits = max(200, cap - sent_chars)
-            if len(head) <= fits:
-                result, ferr = qq.stream_send(cfg, openid, head, 10, index, msg_id,
-                                              stream_id, seq)
-                if not ferr:
-                    qq.log(f"stream: final chunk sent ({len(head)} chars)")
-                    qq.remember_message(cfg, result or {},
-                                        {"pane": pane, "agent": agent, "folder": ""})
-                else:
-                    qq.log(f"stream: final chunk failed: {ferr}")
-                touch(done=True)
-                return
-            cut = head.rfind("\n", 0, fits)
-            if cut < int(fits * 0.5):  # no decent line boundary — hard cut
-                cut = fits
-            stream_part = head[:cut].rstrip() + "\n\n（长回复未完，接下条）"
-            result, ferr = qq.stream_send(cfg, openid, stream_part, 10, index, msg_id,
-                                          stream_id, seq)
-            if ferr:
-                qq.log(f"stream: final chunk failed: {ferr}")
-            else:
-                qq.log(f"stream: final chunk sent ({len(stream_part)} chars), "
-                       f"{len(head) - cut} chars follow as messages")
-                qq.remember_message(cfg, result or {},
-                                    {"pane": pane, "agent": agent, "folder": ""})
-            touch(done=True)
-            rest = head[cut:].lstrip()
-            for piece in qq.split_markdown(rest, int(cfg.get("chunk_chars", 1000))):
-                res, perr = qq.send_text(cfg, "c2c", openid, piece)
-                if not perr:
-                    qq.remember_message(cfg, res or {},
-                                        {"pane": pane, "agent": agent, "folder": ""})
+            close_out("✅ ")
             return
         if not chunk(1, fresh):
             return
         time.sleep(interval)
+
+    # deadline hit with no finish signal — still close the stream out so the
+    # hourglass never hangs on QQ forever
+    qq.log(f"stream: deadline on {pane}, closing out")
+    close_out("⌛ ")
+
+
+# --- routing -----------------------------------------------------------------
 
 
 # --- routing -----------------------------------------------------------------
@@ -816,6 +854,38 @@ def handle_attachment(cfg: dict, scene: str, openid: str, msg_id: str, target: d
     reply(cfg, scene, openid, f"📎 {names} → {qq.label(target)}", msg_id, target=target)
 
 
+def capture_slash_reply(cfg: dict, scene: str, reply_to: str, msg_id: str,
+                        target: dict, cmd: str) -> None:
+    """Slash commands answer inside the agent's TUI (model pickers, tables) and
+    never fire a status event — wait a beat, diff the pane tail and push whatever
+    the command rendered. Box-drawing tables ARE the reply here, so only pure
+    spinner frames are filtered (unlike the stream path)."""
+    pane = target["pane"]
+
+    def tail() -> list:
+        out, err = qq.herdr_run("agent", "read", pane, "--lines", "30",
+                                "--format", "text", timeout=10)
+        if err:
+            return []
+        return [l.rstrip() for l in out.splitlines() if l.strip()]
+
+    before = set(tail())
+    parts: list[str] = []
+    for _ in range(3):
+        time.sleep(5)
+        fresh = [l for l in tail() if l not in before
+                 and not re.search(r"[\u2800-\u28FF]", l)]
+        before = set(tail())
+        if fresh:
+            parts.extend(fresh)
+            if len(parts) > 8:  # picker table captured — enough
+                break
+    body = "\n".join(parts).strip()
+    if not body:
+        return
+    reply(cfg, scene, reply_to, f"⌨️ {cmd[:30]}\n{body[-1200:]}", msg_id, target=target)
+
+
 def handle_message(cfg: dict, d: dict) -> None:
     scene, reply_to, sender = qq.event_ids(d)
     if scene != qq.scene_cfg(cfg):
@@ -882,6 +952,9 @@ def handle_message(cfg: dict, d: dict) -> None:
     # behind a running task (otherwise the completion push is the receipt)
     if text2.startswith("/"):
         reply(cfg, scene, reply_to, f"⌨️ {text2[:30]} → {qq.label(target)}", msg_id, target=target)
+        # the command's answer renders in the TUI — bring it back to QQ
+        threading.Thread(target=capture_slash_reply, daemon=True,
+                         args=(cfg, scene, reply_to, msg_id, target, text2)).start()
     elif queued:
         reply(cfg, scene, reply_to, f"📥 已排队（{qq.label(target)} 完成当前任务后执行）",
               msg_id, target=target)
@@ -1082,6 +1155,14 @@ def run_foreground() -> None:
     except OSError:
         pass
     qq.log(f"bot: daemon started pid={os.getpid()}")
+
+    def _thread_crash(args) -> None:
+        # stderr goes to devnull when detached — a dead stream thread must
+        # still leave a trace in the log
+        qq.log(f"bot: thread {args.thread.name} crashed: "
+               f"{args.exc_type.__name__}: {args.exc_value}")
+
+    threading.excepthook = _thread_crash
     try:
         run_daemon(started_at)
     finally:
