@@ -657,6 +657,28 @@ def main() -> None:
         if not err and out.strip():
             tail = " ".join(out.strip().split())[-350:]
             reply = (reply + "\n\n❓ " + tail) if reply else "❓ " + tail
+        # numbered options in the pane become tappable buttons
+        opts, _cur = qq.pane_options(pane_id)
+        if opts and cfg.get("keyboard_mode", "markdown") != "off":
+            scene0 = qq.scene_cfg(cfg)
+            openid0 = qq.push_target(cfg)[1]
+            if openid0:
+                kb = qq.options_keyboard(pane_id, opts)
+                sent = False
+                for use_md in ((True, False) if cfg.get("markdown", True) else (False,)):
+                    body = ({"msg_type": 2, "markdown": {"content": reply}} if use_md
+                            else {"msg_type": 0, "content": reply})
+                    body["keyboard"] = kb
+                    result, kerr = qq.api(cfg, "POST",
+                                          qq._messages_path(scene0, openid0), body)
+                    if not kerr:
+                        qq.remember_message(cfg, result or {},
+                                            {"pane": pane_id, "agent": agent, "folder": folder})
+                        sent = True
+                        break
+                    qq.log(f"blocked push keyboard attempt failed: {kerr.split()[0]}")
+                if sent:
+                    return  # keyboard push delivered; nothing else to send
 
     # a live progress stream that just covered this pane already showed the
     # answer — a second full-size push would dump it all over again

@@ -877,6 +877,27 @@ def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
         return
     if not pane:
         return
+    if pane.startswith("paneopt:"):
+        # an option button from a blocked push: navigate the pane's selector to
+        # that digit (read live, the highlight may have moved) and press Enter
+        _, optpane, digit = pane.split(":", 2)
+        opts, cur = qq.pane_options(optpane)
+        cur = cur or (int(opts[0][0]) if opts else 0)
+        target_digit = int(digit)
+        keys = []
+        if cur and target_digit != cur:
+            delta = target_digit - cur
+            keys = ["down"] * delta if delta > 0 else ["up"] * (-delta)
+        for k in keys:
+            qq.herdr_run("agent", "send-keys", optpane, k)
+            time.sleep(0.15)
+        _, kerr = qq.herdr_run("agent", "send-keys", optpane, "enter")
+        label = next((l for dg, l in opts if dg == digit), digit)
+        if reply_to:
+            qq.send_text(cfg, scene, reply_to,
+                         (f"⌨️ 已选 {label}" if not kerr else f"⚠️ 按键发送失败: {kerr}"),
+                         event_id=event_id)
+        return
     result, err = qq.herdr_json("agent", "get", pane)
     agent = result.get("agent", {})
     if err or not agent:

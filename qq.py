@@ -242,6 +242,42 @@ def gateway_url(cfg: dict) -> tuple[str, str]:
     return result.get("url", ""), ("" if result.get("url") else "gateway returned no url")
 
 
+def pane_options(pane: str) -> tuple[list[tuple[str, str]], int]:
+    """Numbered options currently shown in the agent's pane ("❯ 1. Yes" ...),
+    as [(digit, label)], plus the digit the selector is on (0 = unknown).
+    Wrapped option lines are glued onto their number line."""
+    out, err = herdr_run("agent", "read", pane, "--lines", "14", "--format", "text", timeout=10)
+    if err:
+        return [], 0
+    opts: list[tuple[str, str]] = []
+    cur = 0
+    for raw in out.splitlines():
+        stripped = raw.strip()
+        m = re.match(r"^[>❯›]?\s*\(?(\d)[.、)）]\s*(.+)$", stripped)
+        if not m:
+            if opts and stripped and not stripped.startswith(("↑", "↓", "esc", "Enter", "tab", "ctrl")):
+                d, label = opts[-1]
+                opts[-1] = (d, label)  # wrapped continuation: label stays compact
+            continue
+        digit, text = m.group(1), " ".join(m.group(2).split())
+        word = re.sub(r"[^\w\u4e00-\u9fff]+", "", text)[:7] or "?"
+        if raw.lstrip().startswith((">", "❯", "›")):
+            cur = int(digit)
+        opts.append((digit, f"{digit}{word}"))
+    return opts, cur
+
+
+def options_keyboard(pane: str, opts: list[tuple[str, str]]) -> dict:
+    rows = []
+    for i in range(0, len(opts), 2):
+        rows.append({"buttons": [{
+            "id": f"o{j}",
+            "render_data": {"label": label[:10], "style": 1},
+            "action": {"type": 1, "permission": {"type": 2}, "data": f"paneopt:{pane}:{digit}"},
+        } for j, (digit, label) in enumerate(opts[i:i + 2])]})
+    return {"content": {"rows": rows}}
+
+
 def ack_interaction(cfg: dict, interaction_id: str) -> str:
     """PUT /interactions/{id} — the platform expects every button callback to be
     acknowledged this way; skipping it makes the QQ client show 第三方请求失败."""
