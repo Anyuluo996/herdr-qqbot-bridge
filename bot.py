@@ -25,6 +25,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -40,11 +41,12 @@ HELP = (
     "· #start 类型 — 启动 agent（别名 #启动）\n"
     "· #close 名称 — 关闭（别名 #停止）\n"
     "· #status — 全部 agent 状态总览\n"
+    "· #sh 命令 — 本机执行 shell（需 allow_shell）\n"
     "· #read 行数 — 看当前 agent 的终端输出\n"
     "· #esc — 发 Esc 中断；#key 键名 — 发按键\n"
     "· #help — 本说明\n\n"
     "**透传**（插件不接管）\n"
-    "· 直接发文字 = 当作 prompt 发给当前 agent\n"
+    "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时滚动进度）\n"
     "· /xxx = agent 自己的命令（/model /clear…）\n"
     "· 引用我的通知 = 精确路由到那条通知对应的 agent"
 )
@@ -401,6 +403,28 @@ def cmd_close(cfg: dict, scene: str, openid: str, msg_id: str, args: list) -> No
     reply(cfg, scene, openid, f"🚪 已关闭 {agent_label(agent)}", msg_id)
 
 
+def cmd_sh(cfg: dict, scene: str, openid: str, msg_id: str, command: str, target: dict) -> None:
+    """#! runs on THIS machine — the whole point of a personal bridge, and also
+    the most dangerous button in the house, hence the config gate."""
+    if not cfg.get("allow_shell", False):
+        reply(cfg, scene, openid, "本地命令执行已关闭 — config.toml 里 allow_shell = true 开启", msg_id)
+        return
+    if not command:
+        reply(cfg, scene, openid, "用法：#sh <命令> — 在本机执行（工作目录跟随当前 agent）", msg_id)
+        return
+    cwd = ""
+    if target.get("pane"):
+        info, err = qq.herdr_json("agent", "get", target["pane"], timeout=10)
+        if not err:
+            cwd = info.get("agent", {}).get("cwd") or ""
+    out, err = qq.run_shell(cfg, command, cwd=cwd, timeout=int(cfg.get("shell_timeout", 30)))
+    text = f"$ {command}\n" + (err if err else (out or "（无输出）"))
+    limit = int(cfg.get("chunk_chars", 1000)) * 2
+    if len(text) > limit:
+        text = "…\n" + text[-limit:]
+    reply(cfg, scene, openid, text, msg_id, target=target)
+
+
 def cmd_read(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, args: list) -> None:
     lines = args[1] if len(args) > 1 and args[1].isdigit() else str(cfg.get("read_lines", 40))
     out, err = qq.herdr_run("agent", "read", target["pane"], "--lines", lines, "--format", "text")
@@ -461,6 +485,12 @@ def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -
         cmd_close(cfg, scene, openid, msg_id, args)
         return
 
+    body = text[1:]
+    if cmd in ("sh", "!", "shell", "命令"):
+        raw = body.split(None, 1)[1].strip() if len(body.split(None, 1)) > 1 else ""
+        cmd_sh(cfg, scene, openid, msg_id, raw, qq.current_target())
+        return
+
     target = qq.current_target()
     if not target.get("pane"):
         reply(cfg, scene, openid, "🤷 还没有选中 agent — #agents 选择，或 #start 启动", msg_id)
@@ -481,6 +511,55 @@ def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -
         return
 
     reply(cfg, scene, openid, f"❓ 未知指令 #{cmd} — #help 看清单", msg_id)
+
+
+# --- live progress streaming -------------------------------------------------
+
+
+def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) -> None:
+    """Grow one QQ streaming message with new terminal lines while the agent
+    works, then finish it with the reply. Replace mode requires the accumulated
+    text's prefix to never change — this only ever appends."""
+    interval = max(3, int(cfg.get("stream_interval_seconds", 8)))
+    deadline = time.monotonic() + int(cfg.get("stream_max_seconds", 600))
+    sent = f"⏳ {label}\n"
+    seen: set[str] = set()
+    index = 0
+    stream_id = None
+    seq = qq.next_seq(msg_id)
+
+    def chunk(state: int, text: str) -> bool:
+        nonlocal stream_id, index
+        sid, err = qq.stream_send(cfg, openid, text, state, index, msg_id, stream_id, seq)
+        if err:
+            qq.log(f"stream: chunk {index} failed: {err}")
+            return False
+        stream_id, index = sid, index + 1
+        return True
+
+    if not chunk(1, sent):
+        return
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        status = agent_status(pane)
+        out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
+        if not err:
+            for ln in out.splitlines():
+                ln = ln.rstrip()
+                if not ln or ln in seen or SPINNER_RE.search(ln):
+                    continue
+                seen.add(ln)
+                sent += ln + "\n"
+        if status not in ("working", "unknown", ""):
+            import notify  # lazy: transcript sniffing is only needed at the end
+            final = notify.reply_snippet_of_pane(pane) or "（已完成，详见完成推送）"
+            chunk(10, (sent + "✅ " + final)[:2000])
+            return
+        if len(sent) > 1800:
+            chunk(10, sent + "…\n（进度流到此收起，完成后仍有总结推送）")
+            return
+        if not chunk(1, sent):
+            return
 
 
 # --- routing -----------------------------------------------------------------
@@ -633,6 +712,11 @@ def handle_message(cfg: dict, d: dict) -> None:
         return
     qq.set_current_target(target)
     qq.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
+    if scene == "c2c" and cfg.get("stream_progress", True) and not text.startswith("/"):
+        # live progress: one QQ streaming message grows with the terminal while
+        # the agent works (c2c only — group messages don't support streaming)
+        threading.Thread(target=stream_progress, daemon=True,
+                         args=(cfg, openid, target["pane"], msg_id, qq.label(target))).start()
 
 
 def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:

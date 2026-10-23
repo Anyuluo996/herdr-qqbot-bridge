@@ -426,6 +426,14 @@ def reply_snippet(agent: str, session: dict, cwd: str) -> str:
     return found
 
 
+def reply_snippet_of_pane(pane_id: str) -> str:
+    """Reply text for a pane without an event payload (streaming finale)."""
+    info = agent_info(pane_id)
+    cwd = info.get("cwd") or info.get("foreground_cwd") or ""
+    agent = info.get("display_agent") or info.get("agent") or ""
+    return tidy(reply_snippet(agent, info.get("agent_session") or {}, cwd))
+
+
 def tidy(text: str) -> str:
     """Trim trailing spaces and collapse blank-line runs, keeping the markdown shape."""
     out: list[str] = []

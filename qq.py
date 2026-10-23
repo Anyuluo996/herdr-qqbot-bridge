@@ -249,6 +249,40 @@ def ack_interaction(cfg: dict, interaction_id: str) -> str:
     return err
 
 
+def stream_send(cfg: dict, openid: str, content: str, state: int, index: int,
+                msg_id: str, stream_msg_id: str | None, msg_seq: int) -> tuple[str, str]:
+    """One chunk of a c2c streaming message (POST /v2/users/{id}/stream_messages).
+    replace mode: content_raw is the FULL text and must start with everything
+    already sent (error 40007 otherwise). Returns (stream_msg_id, err)."""
+    body = {"input_mode": "replace", "input_state": state, "index": index,
+            "content_type": "markdown", "content_raw": content,
+            "msg_id": msg_id, "msg_seq": msg_seq}
+    if stream_msg_id:
+        body["stream_msg_id"] = stream_msg_id
+    result, err = api(cfg, "POST", f"/v2/users/{openid}/stream_messages", body)
+    if err:
+        return (stream_msg_id or ""), err
+    return result.get("id") or (stream_msg_id or ""), ""
+
+
+def run_shell(cfg: dict, command: str, cwd: str = "",
+              timeout: int = 30) -> tuple[str, str]:
+    """Execute a shell command locally -> (combined output tail, err). Only ever
+    called behind the allow_shell config gate."""
+    workdir = cwd or str(cfg.get("shell_cwd", "") or os.path.expanduser("~"))
+    try:
+        out = subprocess.run(command, shell=True, capture_output=True, timeout=timeout,
+                             cwd=workdir)
+    except subprocess.TimeoutExpired:
+        return "", f"超时（>{timeout}s，已终止）"
+    except Exception as e:
+        return "", repr(e)
+    text = (out.stdout.decode(errors="replace") + out.stderr.decode(errors="replace")).strip()
+    if out.returncode != 0:
+        text += f"\n（exit {out.returncode}）"
+    return text, ""
+
+
 def intents(cfg: dict) -> int:
     """1<<25 covers c2c + group @ messages; 1<<26 covers keyboard callbacks."""
     default = (1 << 25) | (1 << 26)
