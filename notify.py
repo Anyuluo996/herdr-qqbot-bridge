@@ -426,6 +426,56 @@ def reply_snippet(agent: str, session: dict, cwd: str) -> str:
     return found
 
 
+def transcript_step_lines(agent: str, path: str, offset: int) -> tuple[str, int]:
+    """New transcript entries since byte `offset`, formatted as progress lines:
+    💭 thinking, 🔧 tool calls, · interim text. Returns ("", new_offset). The
+    transcript is where an agent's intermediate steps actually live — the
+    terminal TUI redraws in place and polls miss them."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return "", offset
+    if not data:
+        return "", offset
+    lines = qq._decode(data).split("\n")
+    remainder = lines.pop()  # partial trailing line unless the read ended on \n
+    new_offset = offset + len(data) - len(remainder.encode("utf-8"))
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        msg = o.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            ct = c.get("type")
+            if ct == "thinking":
+                t = " ".join(str(c.get("thinking", "")).split())
+                if t:
+                    out.append("💭 " + t[:120])
+            elif ct in ("toolCall", "tool_use"):
+                name = str(c.get("name", "?"))
+                args = c.get("arguments") or c.get("input") or {}
+                brief = (args.get("command") if isinstance(args, dict) else None) \
+                    or (args.get("file_path") if isinstance(args, dict) else None) \
+                    or json.dumps(args, ensure_ascii=False)
+                out.append(f"🔧 {name} " + " ".join(str(brief).split())[:100])
+            elif ct == "text":
+                t = " ".join(str(c.get("text", "")).split())
+                if t:
+                    out.append("· " + t[:120])
+    return ("\n".join(out) + "\n") if out else "", new_offset
+
+
 def reply_snippet_of_pane(pane_id: str) -> str:
     """Reply text for a pane without an event payload (streaming finale)."""
     info = agent_info(pane_id)

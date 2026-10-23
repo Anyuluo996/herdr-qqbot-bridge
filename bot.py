@@ -46,7 +46,7 @@ HELP = (
     "· #esc — 发 Esc 中断；#key 键名 — 发按键\n"
     "· #help — 本说明\n\n"
     "**透传**（插件不接管）\n"
-    "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时滚动进度）\n"
+    "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时流式显示思维链/工具调用）\n"
     "· /xxx = agent 自己的命令（/model /clear…）\n"
     "· 引用我的通知 = 精确路由到那条通知对应的 agent"
 )
@@ -517,12 +517,35 @@ def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -
 
 
 def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) -> None:
-    """Live progress in one QQ streaming message: every poll appends only the
-    terminal lines that appeared since the last one (append mode — no prefix
-    constraints), and the final chunk carries the transcript reply. A quiet
-    agent (LLM thinking) simply has nothing to append until output flows."""
-    interval = max(3, int(cfg.get("stream_interval_seconds", 5)))
+    """Live progress in one QQ streaming message. Steps and thinking come from
+    the agent's own transcript (appended per entry — thinking/toolCall/text),
+    which is where intermediate work actually shows up; the terminal pane only
+    backfills when no transcript is findable. Append mode: each chunk carries
+    just the new lines."""
+    interval = max(2, int(cfg.get("stream_interval_seconds", 4)))
     deadline = time.monotonic() + int(cfg.get("stream_max_seconds", 600))
+    import notify  # lazy: transcript parsing is only needed while streaming
+
+    agent = kind = cwd = ""
+    tpath = ""
+    info, err = qq.herdr_json("agent", "get", pane, timeout=10)
+    if not err:
+        a = info.get("agent", {})
+        agent = a.get("display_agent") or a.get("agent") or ""
+        kind = a.get("agent") or ""
+        cwd = a.get("cwd") or a.get("foreground_cwd") or ""
+        tpath = (notify.session_file(kind, a.get("agent_session") or {})
+                 or notify.session_file_fallback(kind, cwd))
+    offset = 0
+    if tpath and os.path.isfile(tpath):
+        try:
+            offset = os.path.getsize(tpath)
+        except OSError:
+            tpath = ""
+    else:
+        tpath = ""
+    qq.log(f"stream: source={'transcript' if tpath else 'terminal'} ({agent}, {kind})")
+
     seen: set[str] = set()
     index = 0
     stream_id = None
@@ -540,25 +563,26 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         stream_id, index = sid, index + 1
         return True
 
-    time.sleep(2)  # let the first output land before opening the stream
     if not chunk(1, f"⏳ {label}\n"):
         return
     while time.monotonic() < deadline:
         status = agent_status(pane)
-        out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
         fresh = ""
-        if not err:
-            new_lines = []
-            for ln in out.splitlines():
-                ln = ln.rstrip()
-                if not ln or ln in seen or SPINNER_RE.search(ln):
-                    continue
-                seen.add(ln)
-                new_lines.append(ln)
-            if new_lines:
-                fresh = "\n".join(new_lines) + "\n"
+        if tpath:
+            fresh, offset = notify.transcript_step_lines(kind, tpath, offset)
+        else:
+            out, err = qq.herdr_run("agent", "read", pane, "--lines", "10", "--format", "text")
+            if not err:
+                new_lines = []
+                for ln in out.splitlines():
+                    ln = ln.rstrip()
+                    if not ln or ln in seen or SPINNER_RE.search(ln):
+                        continue
+                    seen.add(ln)
+                    new_lines.append(ln)
+                if new_lines:
+                    fresh = "\n".join(new_lines) + "\n"
         if status not in ("working", "unknown", ""):
-            import notify  # lazy: transcript sniffing is only needed at the end
             final = notify.reply_snippet_of_pane(pane)
             tail = (fresh + "✅ " + final) if final else (fresh + "（已完成，详见完成推送）")
             chunk(10, tail[:1200])
