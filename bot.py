@@ -574,8 +574,10 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         # is (or just was) covering the pane's answer
         qq.write_state("stream_state.json", {pane: {"ts": time.time(), "done": done}})
 
+    sent_chars = 0
+
     def chunk(state: int, text: str) -> bool:
-        nonlocal stream_id, index
+        nonlocal stream_id, index, sent_chars
         if not text:
             return True
         result, err = qq.stream_send(cfg, openid, text, state, index, msg_id, stream_id, seq)
@@ -585,6 +587,7 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
         qq.log(f"stream: chunk {index} sent ({len(text)} chars, state {state})")
         stream_id = result.get("id") or stream_id
         index += 1
+        sent_chars += len(text)
         touch()
         return True
 
@@ -609,19 +612,45 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
                 if new_lines:
                     fresh = "\n".join(new_lines) + "\n"
         if status not in ("working", "unknown", ""):
+            # the stream message carries the answer (the completion push is
+            # suppressed for this pane), but streams have a total length budget —
+            # whatever doesn't fit goes out as regular follow-up messages so a
+            # long reply is never silently truncated
             final = notify.reply_snippet_of_pane(pane)
-            tail = (fresh + "✅ " + final) if final else (fresh + "（已完成）")
-            # the stream message is the answer now — the completion push is
-            # suppressed for this pane, so this chunk carries the routing anchor
-            result, ferr = qq.stream_send(cfg, openid, tail[:1200], 10, index, msg_id,
+            head = "✅ " + final
+            cap = max(600, int(cfg.get("stream_total_chars", 3000)))
+            fits = max(200, cap - sent_chars)
+            if len(head) <= fits:
+                result, ferr = qq.stream_send(cfg, openid, head, 10, index, msg_id,
+                                              stream_id, seq)
+                if not ferr:
+                    qq.log(f"stream: final chunk sent ({len(head)} chars)")
+                    qq.remember_message(cfg, result or {},
+                                        {"pane": pane, "agent": agent, "folder": ""})
+                else:
+                    qq.log(f"stream: final chunk failed: {ferr}")
+                touch(done=True)
+                return
+            cut = head.rfind("\n", 0, fits)
+            if cut < int(fits * 0.5):  # no decent line boundary — hard cut
+                cut = fits
+            stream_part = head[:cut].rstrip() + "\n\n（长回复未完，接下条）"
+            result, ferr = qq.stream_send(cfg, openid, stream_part, 10, index, msg_id,
                                           stream_id, seq)
             if ferr:
                 qq.log(f"stream: final chunk failed: {ferr}")
             else:
-                qq.log(f"stream: final chunk sent ({len(tail)} chars)")
+                qq.log(f"stream: final chunk sent ({len(stream_part)} chars), "
+                       f"{len(head) - cut} chars follow as messages")
                 qq.remember_message(cfg, result or {},
                                     {"pane": pane, "agent": agent, "folder": ""})
             touch(done=True)
+            rest = head[cut:].lstrip()
+            for piece in qq.split_markdown(rest, int(cfg.get("chunk_chars", 1000))):
+                res, perr = qq.send_text(cfg, "c2c", openid, piece)
+                if not perr:
+                    qq.remember_message(cfg, res or {},
+                                        {"pane": pane, "agent": agent, "folder": ""})
             return
         if not chunk(1, fresh):
             return
