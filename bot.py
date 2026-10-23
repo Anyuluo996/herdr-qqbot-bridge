@@ -47,6 +47,7 @@ HELP = (
     "· #help — 本说明\n\n"
     "**透传**（插件不接管）\n"
     "· 直接发文字 = 当作 prompt 发给当前 agent（工作时 QQ 里实时流式显示思维链/工具调用）\n"
+    "· pi> 文字 或 @pi 文字 — 指名发给某个 agent，不改变默认目标（可并行多线对话）\n"
     "· /xxx = agent 自己的命令（/model /clear…）\n"
     "· 引用我的通知 = 精确路由到那条通知对应的 agent"
 )
@@ -660,6 +661,32 @@ def stream_progress(cfg: dict, openid: str, pane: str, msg_id: str, label: str) 
 # --- routing -----------------------------------------------------------------
 
 
+ADDRESS_RE = re.compile(r"^@?([\w.-]{1,24})>\s*(.+)$", re.S)  # "pi> fix it"
+
+
+def split_addressing(cfg: dict, text: str) -> tuple[dict | None, str, str]:
+    """Inline addressing: 'name> text' or '@name text' routes one message to a
+    specific agent WITHOUT moving the default target — parallel conversations.
+    Returns (target, remaining_text, miss_name); target None with miss_name set
+    means the pattern matched but no agent carries that name."""
+    m = ADDRESS_RE.match(text)
+    if not m:
+        m2 = re.match(r"^@([\w.-]{1,24})\s+(.+)$", text)
+        if not m2:
+            return None, text, ""
+        m = m2
+    name = m.group(1).lower()
+    rest = m.group(2).strip()
+    for a in list_agents():
+        for candidate in (a.get("name"), a.get("display_agent"), a.get("agent")):
+            if candidate and str(candidate).lower() == name:
+                return target_from_agent(a), rest, ""
+    for entry in cfg.get("agent", []):
+        if str(entry.get("name", "")).lower() == name:
+            return ({"pane": "", "agent": entry.get("name", name), "folder": ""}), rest, ""
+    return None, text, m.group(1)
+
+
 def resolve(cfg: dict, scene: str, openid: str, msg_id: str, d: dict) -> dict:
     """Which agent does this message address? The quoted notification, else the
     most recently active agent (unless reply_to_latest is turned off)."""
@@ -797,17 +824,30 @@ def handle_message(cfg: dict, d: dict) -> None:
     # everything else passes through to the agent: plain text as a prompt,
     # /slash as the agent's own command — the plugin takes over neither, and
     # stays quiet on success (the completion push is the feedback)
-    target = resolve(cfg, scene, reply_to, msg_id, d)
-    if not target.get("pane"):
+    addressed, text2, miss = split_addressing(cfg, text)
+    if miss:
+        reply(cfg, scene, reply_to, f"🤷 没有叫 {miss!r} 的 agent — #agents 看列表", msg_id)
         return
-    err = submit(cfg, target["pane"], text)
+    if addressed:
+        target = addressed
+        if not target.get("pane"):
+            reply(cfg, scene, reply_to, f"⚠️ {target['agent']} 还没启动 — #start {target['agent']}", msg_id)
+            return
+    else:
+        text2 = text
+        target = resolve(cfg, scene, reply_to, msg_id, d)
+        if not target.get("pane"):
+            return
+    err = submit(cfg, target["pane"], text2)
     if err:
         qq.log(f"bot: prompt {target['pane']} failed: {err}")
         report_failure(cfg, scene, reply_to, msg_id, target, err)
         return
-    qq.set_current_target(target)
-    qq.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
-    if scene == "c2c" and cfg.get("stream_progress", True) and not text.startswith("/"):
+    if not addressed:
+        qq.set_current_target(target)
+    qq.log(f"bot: prompted {target['pane']} ({len(text2)} chars"
+           f"{', addressed' if addressed else ''})")
+    if scene == "c2c" and cfg.get("stream_progress", True) and not text2.startswith("/"):
         # live progress: one QQ streaming message grows with the terminal while
         # the agent works (c2c only — group messages don't support streaming)
         threading.Thread(target=stream_progress, daemon=True,
