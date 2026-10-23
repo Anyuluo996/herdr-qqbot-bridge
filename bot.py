@@ -35,19 +35,34 @@ MAX_BUTTONS = 8
 KEY_RE = re.compile(r"^[\w+-]{1,16}$")  # key names allowed for #key
 
 HELP = (
-    "【插件指令】# 开头：\n"
-    "#agents — 列出 agent（#use 序号/名称 切换）\n"
-    "#start <类型|配置名> — 启动 agent（别名 #启动）\n"
-    "#close <名称> — 关闭 agent（别名 #停止）\n"
-    "#status — 全部 agent 状态总览\n"
-    "#read [行数] — 看当前 agent 的终端输出\n"
-    "#esc — 发 Esc 中断；#key <键名> — 发按键（down/enter/tab…）\n"
-    "#help — 本说明\n\n"
-    "【透传】其余全部直达当前 agent，插件不接管：\n"
-    "直接发文字 = 当作 prompt 发给它\n"
-    "/xxx = 它自己的斜杠命令（/model /clear /compact…）\n"
-    "引用（回复）我的通知 = 精确路由到那条通知对应的 agent"
+    "**插件指令**（# 开头）\n"
+    "· #agents — 列出 agent，#use 序号/名称 切换\n"
+    "· #start 类型 — 启动 agent（别名 #启动）\n"
+    "· #close 名称 — 关闭（别名 #停止）\n"
+    "· #status — 全部 agent 状态总览\n"
+    "· #read 行数 — 看当前 agent 的终端输出\n"
+    "· #esc — 发 Esc 中断；#key 键名 — 发按键\n"
+    "· #help — 本说明\n\n"
+    "**透传**（插件不接管）\n"
+    "· 直接发文字 = 当作 prompt 发给当前 agent\n"
+    "· /xxx = agent 自己的命令（/model /clear…）\n"
+    "· 引用我的通知 = 精确路由到那条通知对应的 agent"
 )
+
+# #help quick-menu: 指令按钮 fill the input box (enter=true auto-sends in c2c)
+HELP_BUTTONS = ["#agents", "#status", "#start", "#read", "#esc", "#help"]
+
+
+def help_keyboard(scene: str) -> dict:
+    rows = []
+    for i in range(0, len(HELP_BUTTONS), 3):
+        rows.append({"buttons": [{
+            "id": f"h{i + j}",
+            "render_data": {"label": btn[:10], "style": 1},
+            "action": {"type": 2, "permission": {"type": 2}, "data": btn,
+                       "enter": scene == "c2c"},
+        } for j, btn in enumerate(HELP_BUTTONS[i:i + 3])]})
+    return {"content": {"rows": rows}}
 
 GONE = ("not found", "agent_not_found", "pane_not_found", "invalid pane")
 
@@ -281,9 +296,13 @@ def free_pane(cfg: dict) -> tuple[str, str]:
     if err:
         return "", f"pane list: {err}"
     panes = result.get("panes", [])
-    for p in panes:
-        if p.get("pane_id") not in used and p.get("agent_status", "unknown") in ("", "unknown"):
-            return p["pane_id"], ""
+    free = [p for p in panes
+            if p.get("pane_id") not in used and p.get("agent_status", "unknown") in ("", "unknown")]
+    if free:
+        # the focused pane is whatever the user is typing in — take it only as a
+        # last resort
+        pick = next((p for p in free if not p.get("focused")), free[0])
+        return pick["pane_id"], ""
     focused = next((p for p in panes if p.get("focused")), panes[0] if panes else None)
     if not focused:
         return "", "没有可用 pane，也没有可拆分的焦点 pane"
@@ -424,7 +443,7 @@ def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str) -
     args = parts[1:]
 
     if cmd in ("help", "帮助", "?"):
-        reply(cfg, scene, openid, HELP, msg_id)
+        send_with_keyboard(cfg, scene, openid, HELP, help_keyboard(scene), msg_id)
         return
     if cmd in ("agents", "a", "列表"):
         cmd_agents(cfg, scene, openid, msg_id)
@@ -602,7 +621,8 @@ def handle_message(cfg: dict, d: dict) -> None:
         return
 
     # everything else passes through to the agent: plain text as a prompt,
-    # /slash as the agent's own command — the plugin takes over neither
+    # /slash as the agent's own command — the plugin takes over neither, and
+    # stays quiet on success (the completion push is the feedback)
     target = resolve(cfg, scene, reply_to, msg_id, d)
     if not target.get("pane"):
         return
@@ -613,8 +633,6 @@ def handle_message(cfg: dict, d: dict) -> None:
         return
     qq.set_current_target(target)
     qq.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
-    ack = f"➡️ {text[:40]}{'…' if len(text) > 40 else ''} → {qq.label(target)}"
-    reply(cfg, scene, reply_to, ack, msg_id, target=target)
 
 
 def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
@@ -623,6 +641,12 @@ def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
     pane = (data.get("resolved") or {}).get("button_data") or data.get("button_data") or ""
     scene, reply_to, sender = qq.interaction_ids(d)
     qq.log(f"bot: interaction from {sender[:12]}… scene={scene} data={pane[:24]!r}")
+    # the platform requires an explicit ack for every callback — without it the
+    # client shows 第三方请求失败, even when our reply message gets through
+    if event_id:
+        err = qq.ack_interaction(cfg, event_id)
+        if err:
+            qq.log(f"bot: interaction ack failed: {err}")
     if scene != qq.scene_cfg(cfg):
         return
     reason = authorized(cfg, scene, reply_to, sender)

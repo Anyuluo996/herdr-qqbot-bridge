@@ -53,6 +53,28 @@ def session_file(agent: str, session: dict) -> str:
     return ""
 
 
+def session_file_fallback(agent: str, cwd: str) -> str:
+    """herdr reports no agent_session for some launches; find the newest
+    transcript belonging to this cwd from the agent's own storage. The recency
+    window keeps us honest when several agents share one directory."""
+    if not cwd:
+        return ""
+    home = os.path.expanduser("~")
+    now = time.time()
+    fresh = 30 * 60
+    if agent == "claude":
+        slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # C:\Users\anyul → C--Users-anyul
+        hits = glob.glob(os.path.join(home, ".claude", "projects", slug, "*.jsonl"))
+    elif agent == "pi":
+        slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)  # sessions/--C--Users-anyul--/
+        hits = [h for h in glob.glob(os.path.join(home, ".pi", "agent", "sessions", "*", "*.jsonl"))
+                if slug in os.path.basename(os.path.dirname(h))]
+    else:
+        return ""
+    hits = [h for h in hits if now - os.path.getmtime(h) < fresh]
+    return max(hits, key=os.path.getmtime) if hits else ""
+
+
 TEXT_PARTS = ("text", "output_text", "input_text")  # codex writes user text as input_text
 
 
@@ -333,7 +355,7 @@ def first_prompt(agent: str, session: dict, cwd: str, title: str = "") -> str:
     elif agent == "kimi":
         path = kimi_wire(session.get("value", ""))
     else:
-        path = session_file(agent, session)
+        path = session_file(agent, session) or session_file_fallback(agent, cwd)
     if not path:
         return ""
     for ln in _head_lines(path):
@@ -395,8 +417,13 @@ def reply_snippet(agent: str, session: dict, cwd: str) -> str:
         return last_reply_hermes(session.get("value", ""))
     if agent == "opencode":
         return last_reply_opencode(resolve_session(agent, session, cwd, ""))
-    sf = session_file(agent, session)
-    return last_reply(sf) if sf else ""
+    sf = session_file(agent, session) or session_file_fallback(agent, cwd)
+    if not sf:
+        return ""
+    found = last_reply(sf)
+    if found:
+        qq.log(f"snippet: {os.path.basename(sf)} ({len(found)} chars)")
+    return found
 
 
 def tidy(text: str) -> str:

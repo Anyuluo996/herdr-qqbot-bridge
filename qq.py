@@ -242,6 +242,13 @@ def gateway_url(cfg: dict) -> tuple[str, str]:
     return result.get("url", ""), ("" if result.get("url") else "gateway returned no url")
 
 
+def ack_interaction(cfg: dict, interaction_id: str) -> str:
+    """PUT /interactions/{id} — the platform expects every button callback to be
+    acknowledged this way; skipping it makes the QQ client show 第三方请求失败."""
+    _, err = api(cfg, "PUT", f"/interactions/{interaction_id}", {"code": 0}, retries=1)
+    return err
+
+
 def intents(cfg: dict) -> int:
     """1<<25 covers c2c + group @ messages; 1<<26 covers keyboard callbacks."""
     default = (1 << 25) | (1 << 26)
