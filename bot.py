@@ -1,138 +1,65 @@
 #!/usr/bin/env python3
-"""herdr plugin daemon: turn Telegram replies back into agent input.
+"""herdr plugin daemon: hold the QQ gateway WebSocket and turn QQ replies back
+into agent input.
 
-Long-polls getUpdates. A reply to one of the plugin's notifications is submitted to
-that notification's agent via `herdr agent prompt`; a plain message goes to the most
-recently active agent. Photos and files are saved to the plugin's inbox and the agent is
-handed their path. Also serves /agents, /read and /esc.
+Receives C2C / group @ messages and keyboard callbacks over the gateway. A quote
+reply to one of the plugin's notifications is submitted to that notification's
+agent via `herdr agent prompt`; a plain message goes to the most recently active
+agent. Files are saved to the plugin's inbox and the agent is handed their path.
+Also serves /agents, /read and /esc.
 
-  bot.py --daemon   run the poll loop in the foreground
-  bot.py --ensure   start the poller if it isn't already running, then exit
-  bot.py --stop     stop the running poller
+  bot.py --daemon   run the gateway loop in the foreground
+  bot.py --ensure   start the daemon if it isn't already running, then exit
+  bot.py --stop     stop the running daemon
   bot.py --restart  stop it and start a fresh one (picks up edited code)
-  bot.py --status   report whether the poller is running
+  bot.py --status   report whether the daemon is running
 """
 
 import json
 import os
-import signal
+import socket
 import sys
 import time
+from datetime import datetime, timezone
 
-import notify
-import tg
+import qq
+import qqws
 
-OFFSET = "bot_offset.json"
-POLL_SECONDS = 50
-MAX_BUTTONS = 12
-TELEGRAM_TEXT_LIMIT = 3500  # the API caps at 4096; leave room for our own prefix
-SWEEP_EVERY = 6 * 3600      # how often the inbox is checked for expired files
-HEADER = "dir:"             # callback_data prefix marking a label-only row
+MAX_BUTTONS = 8
 
 HELP = (
-    "Reply to any of my notifications and I'll send that text to the agent it came from.\n"
-    "A plain message (no reply) goes to the most recently active agent.\n\n"
-    "/agents — list agents and pick one\n"
-    "/read [lines] — show that agent's recent terminal output\n"
-    "/esc — send Escape to interrupt the agent\n"
-    "/help — this message\n\n"
-    "Send a photo or file and I'll save it, then hand the agent its path."
+    "引用（回复）我的任何通知，文字会发给那个 agent；\n"
+    "直接发消息（不引用）会发给最近活跃的 agent。\n\n"
+    "/agents — 列出 agent 并选择\n"
+    "/read [行数] — 查看 agent 最近的终端输出\n"
+    "/esc — 向 agent 发送 Esc 中断\n"
+    "/help — 本说明\n\n"
+    "发文件/图片给我，会保存后把路径交给 agent。"
 )
 
-COMMANDS = [
-    {"command": "agents", "description": "List agents and pick one"},
-    {"command": "read", "description": "Recent terminal output"},
-    {"command": "esc", "description": "Interrupt the agent"},
-    {"command": "help", "description": "How replies work"},
-]
+GONE = ("not found", "agent_not_found", "pane_not_found", "invalid pane")
 
 
-def register_commands(cfg: dict) -> None:
-    """Publish the command list to Telegram. Without this the commands still work when
-    typed, but nothing advertises them — no menu button, no autocomplete."""
-    _, err = tg.api(cfg, "setMyCommands", {"commands": json.dumps(COMMANDS)}, retries=1)
-    tg.log(f"bot: setMyCommands failed: {err}" if err else "bot: published the / command menu")
-
-
-def authorized(cfg: dict, chat: int, user: int) -> bool:
-    """Only the configured chat may drive agents; allowed_user_ids narrows it further."""
-    if not tg.chat_id(cfg) or str(chat) != tg.chat_id(cfg):
+def stop_requested(started_at: float) -> bool:
+    """The stop flag's mtime must postdate this daemon, or every daemon would
+    see the previous run's flag."""
+    try:
+        return os.path.getmtime(qq.stop_flag_path()) >= started_at
+    except OSError:
         return False
-    allowed = cfg.get("allowed_user_ids", [])
-    return not allowed or str(user) in {str(u) for u in allowed}
+
+
+def agent_status(pane: str) -> str:
+    info, err = qq.herdr_json("agent", "get", pane, timeout=10)
+    return "" if err else info.get("agent", {}).get("agent_status", "")
 
 
 def target_from_agent(agent: dict) -> dict:
     return {
         "pane": agent.get("pane_id", ""),
         "agent": agent.get("display_agent") or agent.get("agent") or "agent",
-        "folder": tg.short_home(agent.get("cwd") or agent.get("foreground_cwd") or ""),
+        "folder": qq.short_home(agent.get("cwd") or agent.get("foreground_cwd") or ""),
     }
-
-
-def button_label(cfg: dict, agent: dict, target: dict, with_folder: bool = True) -> str:
-    """Label for an /agents button. Several agents routinely share a working directory,
-    so the pane title is what tells them apart — but a title is sometimes just the folder
-    name or a generic banner, so the directory earns its place too. Only its last
-    segment: the buttons are read on a phone. Under a directory header it is dropped."""
-    emoji = tg.STATUS_EMOJI.get(agent.get("agent_status", ""), "❔")
-    where = os.path.basename(target["folder"].rstrip("/")) or target["folder"]
-    title = notify.display_title(agent, agent.get("agent") or "", agent.get("pane_id") or "")
-    limit = int(cfg.get("button_title_chars", 32))
-    if len(title) > limit:
-        title = title[:limit].rstrip() + "…"
-    parts = [f"{emoji} {target['agent']}"]
-    if with_folder and where:
-        parts.append(where)
-    if title and title != where:
-        parts.append(title)
-    return " · ".join(p for p in parts if p)
-
-
-def header_data(folder: str) -> str:
-    """callback_data for a directory header. Capped at Telegram's 64 bytes, cutting on a
-    byte boundary that keeps the string decodable."""
-    return (HEADER + folder).encode()[:64].decode(errors="ignore")
-
-
-def agent_keyboard(cfg: dict, agents: list) -> list:
-    """Rows grouped by working directory, most recently active group first.
-
-    A keyboard has no way to render a heading between rows, so each group opens with a
-    button that is only a label — tapping it just names the directory back.
-    """
-    groups: dict[str, list] = {}
-    for a in agents:
-        target = target_from_agent(a)
-        groups.setdefault(target["folder"], []).append((a, target))
-    order = sorted(groups.items(),
-                   key=lambda kv: -max(a.get("state_change_seq", 0) for a, _ in kv[1]))
-    rows = []
-    for folder, members in order:
-        members.sort(key=lambda m: m[0].get("state_change_seq", 0), reverse=True)
-        rows.append([{"text": f"📁 {folder or '?'}", "callback_data": header_data(folder)}])
-        for a, target in members:
-            rows.append([{"text": button_label(cfg, a, target, with_folder=False),
-                          "callback_data": target["pane"]}])
-    return rows
-
-
-GONE = ("not found", "agent_not_found", "pane_not_found", "invalid pane")
-
-
-def report_failure(cfg: dict, chat: int, msg_id, target: dict, err: str) -> None:
-    """A closed pane is the common case and deserves plain language — herdr's own
-    "agent target w1:p18 not found" is accurate but says nothing about what to do."""
-    if any(m in err.lower() for m in GONE):
-        say(cfg, chat, f"🚪 {tg.label(target)} is gone — that pane has been closed.\n"
-                       "Pick another agent with /agents.", reply_to=msg_id)
-    else:
-        say(cfg, chat, f"⚠️ {tg.label(target)}: {err}", reply_to=msg_id)
-
-
-def agent_status(pane: str) -> str:
-    info, err = tg.herdr_json("agent", "get", pane, timeout=10)
-    return "" if err else info.get("agent", {}).get("agent_status", "")
 
 
 def submit(cfg: dict, pane: str, text: str) -> str:
@@ -145,7 +72,7 @@ def submit(cfg: dict, pane: str, text: str) -> str:
     Enter once more if it never does.
     """
     was_working = agent_status(pane) == "working"
-    _, err = tg.herdr_run("agent", "prompt", pane, text, timeout=60)
+    _, err = qq.herdr_run("agent", "prompt", pane, text, timeout=60)
     if err:
         return err
     if was_working or not cfg.get("submit_fallback", True):
@@ -156,356 +83,470 @@ def submit(cfg: dict, pane: str, text: str) -> str:
         status = agent_status(pane)
         if not status or status == "working":
             return ""  # picked it up (or we can't tell — better than a double submit)
-    tg.log(f"bot: {pane} never started working; pressing enter to submit")
-    _, err = tg.herdr_run("agent", "send-keys", pane, "enter")
+    qq.log(f"bot: {pane} never started working; pressing enter to submit")
+    _, err = qq.herdr_run("agent", "send-keys", pane, "enter")
     return err
 
 
-def say(cfg: dict, chat: int, text: str, target: dict | None = None, reply_to=None,
-        markup: dict | None = None, plain: str | None = None) -> None:
-    """Send a message, remembering which agent it is about so replies to it route back.
-    `plain` enables HTML rendering with itself as the fallback if Telegram rejects it."""
-    params = {"chat_id": chat, "text": text[:TELEGRAM_TEXT_LIMIT + 500],
-              "link_preview_options": '{"is_disabled":true}'}
-    if reply_to:
-        params["reply_to_message_id"] = reply_to
-    if markup:
-        params["reply_markup"] = json.dumps(markup)
-    if plain is not None:
-        params["parse_mode"] = "HTML"
-    result, err = tg.api(cfg, "sendMessage", params)
-    if err and plain is not None and ("parse" in err.lower() or "entit" in err.lower()):
-        tg.log(f"bot: HTML rejected ({err[-160:]}); resending as plain text")
-        params.pop("parse_mode")
-        params["text"] = plain[:TELEGRAM_TEXT_LIMIT]
-        result, err = tg.api(cfg, "sendMessage", params)
+# --- outgoing ----------------------------------------------------------------
+
+
+def reply(cfg: dict, scene: str, openid: str, content: str, msg_id: str | None = None,
+          event_id: str | None = None, target: dict | None = None) -> None:
+    """Send one message, remembering which agent it is about so quoting it routes back."""
+    use_md = bool(cfg.get("markdown", True))
+    if scene == "group" and cfg.get("strip_group_urls", True):
+        content = qq.strip_urls(content)
+    result, err = qq.send_text(cfg, scene, openid, content, msg_id=msg_id, event_id=event_id,
+                               markdown_content=content if use_md else None)
     if err:
-        tg.log(f"bot: send failed: {err}")
+        qq.log(f"bot: reply failed: {err}: {content[:80]!r}")
         return
     if target:
-        tg.remember_target((result or {}).get("message_id"), target,
-                           int(cfg.get("msg_map_limit", tg.MSG_MAP_LIMIT)))
+        qq.remember_message(cfg, result or {}, target)
 
 
-def resolve(cfg: dict, chat: int, reply_to, msg_id) -> dict:
-    """Which agent does this message address? The replied-to notification, else the
-    most recently active agent (unless reply_to_latest is turned off)."""
-    target = tg.target_for_reply(reply_to)
-    if target:
-        return target
-    if reply_to:
-        # An explicit reply names an agent. If that mapping has aged out of the map,
-        # say so — silently redirecting to whoever is current would send your message
-        # to the wrong agent with a confirmation that looks perfectly fine.
-        tg.log(f"bot: no target recorded for message {reply_to}")
-        say(cfg, chat, "🕰 that notification is too old for me to route — "
-                       "reply to a newer one, or pick an agent with /agents", reply_to=msg_id)
-        return {}
-    if not cfg.get("reply_to_latest", True):
-        say(cfg, chat, "↩️ reply to one of my notifications to choose an agent", reply_to=msg_id)
-        return {}
-    target = tg.current_target()
-    if not target.get("pane"):
-        say(cfg, chat, "🤷 no agent picked yet — use /agents", reply_to=msg_id)
-    return target
+def report_failure(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, err: str) -> None:
+    """A closed pane is the common case and deserves plain language."""
+    if any(m in err.lower() for m in GONE):
+        reply(cfg, scene, openid, f"🚪 {qq.label(target)} 已关闭（pane 不在了）。\n用 /agents 另选。", msg_id)
+    else:
+        reply(cfg, scene, openid, f"⚠️ {qq.label(target)}: {err}", msg_id)
 
 
-def handle_command(cfg: dict, chat: int, msg_id, text: str, target: dict) -> None:
+# --- commands ----------------------------------------------------------------
+
+
+def button_label(agent: dict) -> str:
+    """QQ button labels cap at 10 characters, so this is name-only; the status
+    emoji rides along when it fits."""
+    name = agent.get("display_agent") or agent.get("agent") or "agent"
+    emoji = qq.STATUS_EMOJI.get(agent.get("agent_status", ""), "")
+    base = f"{emoji}{name}"[:10] if emoji else name[:10]
+    return base or "agent"
+
+
+def agent_keyboard(agents: list) -> dict:
+    """One callback button per agent; tapping it sends an INTERACTION_CREATE we
+    turn into the active target."""
+    rows = []
+    for i, a in enumerate(agents[:MAX_BUTTONS]):
+        rows.append({"buttons": [{
+            "id": f"ag{i}",
+            "render_data": {"label": button_label(a), "style": 1},
+            "action": {"type": 1, "permission": {"type": 2}, "data": a.get("pane_id", "")},
+        }]})
+    return {"content": {"rows": rows}}
+
+
+def cmd_agents(cfg: dict, scene: str, openid: str, msg_id: str) -> None:
+    result, err = qq.herdr_json("agent", "list")
+    if err:
+        reply(cfg, scene, openid, f"⚠️ {err}", msg_id)
+        return
+    agents = [a for a in result.get("agents", []) if a.get("pane_id")]
+    if not agents:
+        reply(cfg, scene, openid, "🫙 没有在跑的 agent", msg_id)
+        return
+    agents.sort(key=lambda a: a.get("state_change_seq", 0), reverse=True)
+    shown, extra = agents[:MAX_BUTTONS], len(agents) - MAX_BUTTONS
+    text = "🤖 选择要对话的 agent" + (f"（还有 {extra} 个未列出）" if extra > 0 else "")
+    _, send_err = qq.send_text(cfg, scene, openid, text, msg_id=msg_id)
+    if send_err:
+        qq.log(f"bot: /agents header failed: {send_err}")
+        return
+    # the keyboard rides on its own message: a markdown body plus a keyboard is
+    # the one combination the platform documents, and plain text + keyboard is
+    # not — so this stays msg_type=0 always
+    body = {"msg_type": 0, "content": text, "keyboard": agent_keyboard(shown)}
+    qq._attach_passive(body, scene, msg_id, None)
+    _, err2 = qq.api(cfg, "POST", qq._messages_path(scene, openid), body)
+    if err2:
+        qq.log(f"bot: /agents keyboard failed: {err2}")
+
+
+def cmd_read(cfg: dict, scene: str, openid: str, msg_id: str, target: dict, args: list) -> None:
+    lines = args[1] if len(args) > 1 and args[1].isdigit() else str(cfg.get("read_lines", 40))
+    out, err = qq.herdr_run("agent", "read", target["pane"], "--lines", lines, "--format", "text")
+    if err:
+        report_failure(cfg, scene, openid, msg_id, target, err)
+        return
+    body = out.strip() or "（无输出）"
+    head = f"📄 {qq.label(target)}"
+    content = f"{head}\n{body}"
+    if len(content) > int(cfg.get("chunk_chars", 1000)) * 2:
+        # one message can't hold it and a passive reply may only span a few
+        # messages anyway — the whole output goes over as a file
+        result, ferr = qq.send_text_as_file(cfg, scene, openid, content, msg_id=msg_id)
+        if ferr:
+            qq.log(f"bot: /read file fallback failed: {ferr}")
+            trimmed = "…\n" + content[-int(cfg.get("chunk_chars", 1000)):]
+            reply(cfg, scene, openid, trimmed, msg_id, target=target)
+        elif target:
+            qq.remember_message(cfg, result or {}, target)
+        return
+    reply(cfg, scene, openid, content, msg_id, target=target)
+
+
+def handle_command(cfg: dict, scene: str, openid: str, msg_id: str, text: str, target: dict) -> None:
     parts = text.split()
-    cmd = parts[0].split("@")[0].lower()
+    cmd = parts[0].lower()
 
     if cmd in ("/start", "/help"):
-        say(cfg, chat, HELP, reply_to=msg_id)
+        reply(cfg, scene, openid, HELP, msg_id)
         return
 
     if cmd in ("/agents", "/a"):
-        result, err = tg.herdr_json("agent", "list")
-        if err:
-            say(cfg, chat, f"⚠️ {err}", reply_to=msg_id)
-            return
-        agents = [a for a in result.get("agents", []) if a.get("pane_id")]
-        if not agents:
-            say(cfg, chat, "🫙 no agents running", reply_to=msg_id)
-            return
-        agents.sort(key=lambda a: a.get("state_change_seq", 0), reverse=True)
-        shown, extra = agents[:MAX_BUTTONS], len(agents) - MAX_BUTTONS
-        say(cfg, chat, "🤖 pick an agent" + (f"\n(+{extra} more)" if extra > 0 else ""),
-            reply_to=msg_id, markup={"inline_keyboard": agent_keyboard(cfg, shown)})
+        cmd_agents(cfg, scene, openid, msg_id)
         return
 
     if not target.get("pane"):
-        say(cfg, chat, "🤷 no agent picked yet — use /agents", reply_to=msg_id)
+        reply(cfg, scene, openid, "🤷 还没有选择 agent — 先用 /agents", msg_id)
         return
 
     if cmd == "/read":
-        lines = parts[1] if len(parts) > 1 and parts[1].isdigit() else str(cfg.get("read_lines", 40))
-        out, err = tg.herdr_run("agent", "read", target["pane"], "--lines", lines, "--format", "text")
-        if err:
-            report_failure(cfg, chat, msg_id, target, err)
-            return
-        body = out.strip() or "(no output)"
-        if len(body) > TELEGRAM_TEXT_LIMIT:
-            body = "…\n" + body[-TELEGRAM_TEXT_LIMIT:]
-        head = f"📄 {tg.label(target)}"
-        say(cfg, chat, f"{tg.escape_html(head)}\n"
-                       f'<pre><code class="language-plaintext">{tg.escape_html(body)}</code></pre>',
-            plain=f"{head}\n\n{body}", target=target, reply_to=msg_id)
+        cmd_read(cfg, scene, openid, msg_id, target, parts)
         return
 
     if cmd == "/esc":
-        _, err = tg.herdr_run("agent", "send-keys", target["pane"], "esc")
+        _, err = qq.herdr_run("agent", "send-keys", target["pane"], "esc")
         if err:
-            report_failure(cfg, chat, msg_id, target, err)
+            report_failure(cfg, scene, openid, msg_id, target, err)
             return
-        say(cfg, chat, f"⎋ escape sent to {tg.label(target)}", target=target, reply_to=msg_id)
+        reply(cfg, scene, openid, f"⎋ 已向 {qq.label(target)} 发送 Esc", msg_id, target=target)
         return
 
-    say(cfg, chat, f"❓ unknown command {cmd} — try /help", reply_to=msg_id)
+    reply(cfg, scene, openid, f"❓ 未知的命令 {cmd} — 试试 /help", msg_id)
 
 
-def attachment(msg: dict) -> tuple[str, str, int]:
-    """(file_id, sender-supplied name, size) for whatever file this message carries."""
-    if msg.get("photo"):
-        best = max(msg["photo"], key=lambda p: p.get("file_size") or p.get("width", 0))
-        return best.get("file_id", ""), "", best.get("file_size", 0)
-    for key in ("document", "video", "animation", "audio", "voice", "video_note", "sticker"):
-        obj = msg.get(key)
-        if isinstance(obj, dict) and obj.get("file_id"):
-            return obj["file_id"], obj.get("file_name", ""), obj.get("file_size", 0)
-    return "", "", 0
+# --- routing -----------------------------------------------------------------
 
 
-def handle_attachment(cfg: dict, chat: int, msg_id, reply_to, msg: dict) -> None:
-    """Save an incoming file to the inbox and hand the agent its path.
+def resolve(cfg: dict, scene: str, openid: str, msg_id: str, d: dict) -> dict:
+    """Which agent does this message address? The quoted notification, else the
+    most recently active agent (unless reply_to_latest is turned off)."""
+    target = qq.target_for_event(d)
+    if target:
+        return target
+    if qq._event_refs(d):
+        reply(cfg, scene, openid, "🕰 那条通知太老，路由不到了 — 引用新一点的通知，或用 /agents 选择", msg_id)
+        return {}
+    if not cfg.get("reply_to_latest", True):
+        reply(cfg, scene, openid, "↩️ 请引用我的某条通知来选择 agent", msg_id)
+        return {}
+    target = qq.current_target()
+    if not target.get("pane"):
+        reply(cfg, scene, openid, "🤷 还没有选择 agent — 先用 /agents", msg_id)
+    return target
 
-    herdr's injection channel is text only, so the file itself can't be piped into the
-    terminal — the agent gets an absolute path (plus the caption) and reads it itself.
+
+def stale(d: dict, cfg: dict) -> bool:
+    """Gateway RESUME replays messages missed while offline; a stale one must
+    not land in an agent as a prompt."""
+    minutes = float(cfg.get("stale_drop_minutes", 15))
+    ts = d.get("timestamp") or ""
+    try:
+        when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - when).total_seconds()
+        return age > minutes * 60
+    except (ValueError, TypeError):
+        return False
+
+
+def authorized(cfg: dict, scene: str, reply_to: str, sender: str) -> str:
+    """Reason this message may NOT drive agents, or "" when it may."""
+    allowed = [str(u) for u in cfg.get("allow_users", [])]
+    if allowed and sender not in allowed:
+        return "sender not allowlisted"
+    bound_scene, bound = qq.push_target(cfg)
+    if not bound:
+        return "" if cfg.get("auto_bind", True) else "no bound target"
+    if scene != bound_scene:
+        return "scene mismatch"
+    if reply_to != bound:
+        return "not the bound target"
+    return ""
+
+
+# --- handlers ----------------------------------------------------------------
+
+
+def handle_attachment(cfg: dict, scene: str, openid: str, msg_id: str, target: dict,
+                      caption: str, d: dict) -> None:
+    """Save incoming files to the inbox and hand the agent their path.
+
+    herdr's injection channel is text only, so the file itself can't be piped into
+    the terminal — the agent gets absolute paths (plus the caption) and reads them.
     """
-    file_id, name, size = attachment(msg)
     if not cfg.get("accept_files", True):
-        say(cfg, chat, "📎 attachments are off — set accept_files = true", reply_to=msg_id)
+        reply(cfg, scene, openid, "📎 附件接收已关闭（config: accept_files）", msg_id)
         return
     cap = float(cfg.get("max_file_mb", 20))
-    if size and size > cap * 1024 * 1024:
-        say(cfg, chat, f"📎 {size / 1048576:.1f} MB is over the {cap:g} MB limit "
-                       "(Telegram bots can't fetch anything above 20 MB)", reply_to=msg_id)
-        return
+    paths = []
+    for att in (d.get("attachments") or [])[:5]:
+        if not isinstance(att, dict):
+            continue
+        url = att.get("url") or ""
+        name = att.get("filename") or att.get("file_name") or "file"
+        try:
+            size = int(att.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not url:
+            reply(cfg, scene, openid, f"⚠️ {name}: 事件里没有下载地址，忽略", msg_id)
+            continue
+        if size and size > cap * 1024 * 1024:
+            reply(cfg, scene, openid, f"📎 {size / 1048576:.1f} MB 超过 {cap:g} MB 限制", msg_id)
+            continue
+        dest = os.path.join(qq.inbox_dir(),
+                            f"{time.strftime('%Y%m%d-%H%M%S')}-{msg_id[:8]}-{qq.safe_name(name)}")
+        err = qq.download(cfg, url, dest)
+        if err:
+            qq.log(f"bot: download failed: {err}")
+            reply(cfg, scene, openid, f"⚠️ 下载失败: {err}", msg_id)
+            continue
+        qq.log(f"bot: saved {dest} ({os.path.getsize(dest)} bytes)")
+        paths.append(dest)
 
-    target = resolve(cfg, chat, reply_to, msg_id)
-    if not target.get("pane"):
+    if not paths:
         return
-
-    info, err = tg.api(cfg, "getFile", {"file_id": file_id})
-    remote = (info or {}).get("file_path", "")
-    if err or not remote:
-        say(cfg, chat, f"⚠️ couldn't locate that file: {tg.redact(err or 'no file_path', cfg)}",
-            reply_to=msg_id)
-        return
-
-    saved = tg.safe_name(name or os.path.basename(remote))
-    dest = os.path.join(tg.inbox_dir(), f"{time.strftime('%Y%m%d-%H%M%S')}-{msg_id}-{saved}")
-    err = tg.download(cfg, remote, dest)
-    if err:
-        tg.log(f"bot: download failed: {err}")
-        say(cfg, chat, f"⚠️ download failed: {err}", reply_to=msg_id)
-        return
-    tg.log(f"bot: saved {dest} ({os.path.getsize(dest)} bytes)")
-
-    caption = (msg.get("caption") or "").strip()
-    prompt = f"{caption}\n{dest}" if caption else dest
-    tg.log(f"bot: prompting {target['pane']} with {saved}"
-           f"{f' + caption ({len(caption)} chars)' if caption else ' (no caption)'}")
+    prompt = "\n".join(([caption] if caption else []) + paths)
     err = submit(cfg, target["pane"], prompt)
     if err:
-        report_failure(cfg, chat, msg_id, target, err)
+        report_failure(cfg, scene, openid, msg_id, target, err)
         return
-    tg.set_current_target(target)
-    say(cfg, chat, f"📎 {saved} → {tg.label(target)}", target=target, reply_to=msg_id)
+    qq.set_current_target(target)
+    names = "、".join(os.path.basename(p) for p in paths)
+    reply(cfg, scene, openid, f"📎 {names} → {qq.label(target)}", msg_id, target=target)
 
 
-def handle_message(cfg: dict, msg: dict) -> None:
-    chat = msg.get("chat", {}).get("id")
-    user = msg.get("from", {}).get("id")
-    if not authorized(cfg, chat, user):
-        tg.log(f"bot: ignoring message from chat={chat} user={user}")
+def handle_message(cfg: dict, d: dict) -> None:
+    scene, reply_to, sender = qq.event_ids(d)
+    if scene != qq.scene_cfg(cfg):
+        qq.log(f"bot: dropping {scene} message (scene is {qq.scene_cfg(cfg)})")
         return
-    text = (msg.get("text") or "").strip()
-    msg_id = msg.get("message_id")
-    reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+    reason = authorized(cfg, scene, reply_to, sender)
+    msg_id = d.get("id") or ""
+    if reason == "no bound target":
+        if scene == qq.scene_cfg(cfg) and reply_to:
+            qq.bind_target(cfg, scene, reply_to)
+            reply(cfg, scene, reply_to, "✅ 已绑定当前会话，开始使用吧。\n\n" + HELP, msg_id)
+        else:
+            qq.log("bot: message ignored (no bound target, auto_bind off)")
+        return
+    if reason:
+        qq.log(f"bot: ignoring message ({reason}) from {sender[:12]}…")
+        return
+    if stale(d, cfg):
+        qq.log(f"bot: dropping stale message {msg_id[:16]}…")
+        return
 
-    if attachment(msg)[0]:
-        handle_attachment(cfg, chat, msg_id, reply_to, msg)
+    text = qq.strip_mentions(d.get("content") or "")
+    if (d.get("attachments") or []):
+        target = resolve(cfg, scene, reply_to, msg_id, d)
+        if target.get("pane"):
+            handle_attachment(cfg, scene, reply_to, msg_id, target, text, d)
         return
     if not text:
         return
 
     if text.startswith("/"):
-        handle_command(cfg, chat, msg_id, text, tg.target_for_reply(reply_to) or tg.current_target())
+        handle_command(cfg, scene, reply_to, msg_id, text,
+                       qq.target_for_event(d) or qq.current_target())
         return
 
-    target = resolve(cfg, chat, reply_to, msg_id)
+    target = resolve(cfg, scene, reply_to, msg_id, d)
     if not target.get("pane"):
         return
     err = submit(cfg, target["pane"], text)
     if err:
-        tg.log(f"bot: prompt {target['pane']} failed: {err}")
-        report_failure(cfg, chat, msg_id, target, err)
+        qq.log(f"bot: prompt {target['pane']} failed: {err}")
+        report_failure(cfg, scene, reply_to, msg_id, target, err)
         return
-    tg.set_current_target(target)
-    tg.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
-    say(cfg, chat, f"➡️ sent to {tg.label(target)}", target=target, reply_to=msg_id)
+    qq.set_current_target(target)
+    qq.log(f"bot: prompted {target['pane']} ({len(text)} chars)")
+    reply(cfg, scene, reply_to, f"➡️ 已发给 {qq.label(target)}", msg_id, target=target)
 
 
-def handle_callback(cfg: dict, query: dict) -> None:
-    """An /agents button press: make that agent the target for plain messages."""
-    message = query.get("message", {})
-    chat = message.get("chat", {}).get("id")
-    if not authorized(cfg, chat, query.get("from", {}).get("id")):
-        tg.log(f"bot: ignoring callback from chat={chat}")
+def handle_interaction(cfg: dict, d: dict, event_id: str) -> None:
+    """A /agents button press: make that agent the target for plain messages."""
+    data = d.get("data") or {}
+    pane = (data.get("resolved") or {}).get("button_data") or data.get("button_data") or ""
+    scene, reply_to, sender = qq.interaction_ids(d)
+    if scene != qq.scene_cfg(cfg):
         return
-    pane = query.get("data", "")
-    if pane.startswith(HEADER):  # a directory heading, not an agent
-        tg.api(cfg, "answerCallbackQuery",
-               {"callback_query_id": query.get("id"), "text": pane[len(HEADER):] or "directory"})
+    reason = authorized(cfg, scene, reply_to, sender)
+    if reason and reason != "no bound target":
+        qq.log(f"bot: ignoring interaction ({reason})")
         return
-    result, err = tg.herdr_json("agent", "get", pane)
+    if not pane:
+        return
+    result, err = qq.herdr_json("agent", "get", pane)
     agent = result.get("agent", {})
     if err or not agent:
-        tg.api(cfg, "answerCallbackQuery",
-               {"callback_query_id": query.get("id"), "text": err or "agent not found"})
+        if reply_to:
+            qq.send_text(cfg, scene, reply_to, f"⚠️ agent 不在了: {err or 'not found'}", event_id=event_id)
         return
     target = target_from_agent(agent)
-    tg.set_current_target(target)
-    tg.api(cfg, "answerCallbackQuery", {"callback_query_id": query.get("id"), "text": f"→ {tg.label(target)}"})
-    say(cfg, chat, f"🎯 {tg.label(target)}\nreply here, or just send a message", target=target)
+    qq.set_current_target(target)
+    if reply_to:
+        reply(cfg, scene, reply_to, f"🎯 {qq.label(target)}\n现在直接发消息即可（不引用 = 发给它）",
+              event_id=event_id, target=target)
 
 
-def handle_update(cfg: dict, update: dict) -> None:
-    if "callback_query" in update:
-        handle_callback(cfg, update["callback_query"])
-    elif "message" in update:
-        handle_message(cfg, update["message"])
+def handle_dispatch(cfg: dict, t: str, d: dict, event_id: str) -> None:
+    if t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
+        handle_message(cfg, d)
+    elif t == "INTERACTION_CREATE":
+        handle_interaction(cfg, d, event_id)
+    else:
+        qq.log(f"gateway: event {t}")
 
 
-def run_daemon() -> None:
-    lock = tg.bot_lock()
-    if lock is None:
-        tg.log("bot: another poller holds the lock; exiting")
-        return
-    lock.seek(0)
-    lock.truncate()
-    lock.write(str(os.getpid()))
-    lock.flush()
+# --- gateway session ---------------------------------------------------------
 
-    # Raising out of the handler is what makes a stop prompt: the loop spends most of
-    # its life blocked in a 50s long poll, and PEP 475 would otherwise just resume it.
-    # subprocess.run kills its child when an exception unwinds through it.
-    def stop(_sig, _frame):
-        raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    tg.log(f"bot: poller started pid={os.getpid()}")
+def serve(cfg: dict, url: str, session: dict, started_at: float) -> None:
+    """One gateway connection, with heartbeats. Returns when the connection drops
+    (poll_loop reconnects, resuming the session when the gateway still holds it)."""
+    ws = qqws.WS()
+    ws.connect(url)
     try:
-        poll_loop()
+        op, payload = ws.recv_message(timeout=30)
+        hello = json.loads(payload)
+        if hello.get("op") != 10:
+            raise ProtocolError(f"expected HELLO, got op={hello.get('op')}")
+        interval = int((hello.get("d") or {}).get("heartbeat_interval") or 30000) / 1000
+        token = f"QQBot {qq.access_token(cfg)}"
+        if session["id"] and session["seq"]:
+            ws.send_text(json.dumps({"op": 6, "d": {"token": token,
+                                                    "session_id": session["id"],
+                                                    "seq": session["seq"]}}))
+            qq.log("gateway: resuming session")
+        else:
+            ws.send_text(json.dumps({"op": 2, "d": {"token": token,
+                                                    "intents": qq.intents(cfg),
+                                                    "shard": [0, 1]}}))
+        qq.log("gateway: connected")
+        next_beat = time.monotonic() + interval
+        last_ack = time.monotonic()
+        while True:
+            if stop_requested(started_at):
+                raise StopBot()
+            wait = min(next_beat - time.monotonic(), 5.0)
+            try:
+                _, payload = ws.recv_message(timeout=max(0.1, wait))
+            except (socket.timeout, TimeoutError):
+                if time.monotonic() >= next_beat:
+                    ws.send_text(json.dumps({"op": 1, "d": session["seq"]}))
+                    next_beat = time.monotonic() + interval
+                    if time.monotonic() - last_ack > interval * 2.5:
+                        raise ProtocolError("heartbeat timed out")
+                continue
+            msg = json.loads(payload)
+            op = msg.get("op")
+            if op == 11:
+                last_ack = time.monotonic()
+            elif op == 1:  # server wants a heartbeat right now
+                ws.send_text(json.dumps({"op": 1, "d": session["seq"]}))
+                next_beat = time.monotonic() + interval
+            elif op == 7:
+                qq.log("gateway: reconnect requested")
+                return
+            elif op == 9:
+                if not msg.get("d"):
+                    session["id"], session["seq"] = "", 0  # dead session: identify fresh
+                qq.log("gateway: invalid session")
+                return
+            elif op == 0:
+                session["seq"] = msg.get("s", session["seq"])
+                t, d = msg.get("t", ""), msg.get("d") or {}
+                if t == "READY":
+                    session["id"] = d.get("session_id", "")
+                    qq.log("gateway: online")
+                elif t == "RESUMED":
+                    qq.log("gateway: resumed")
+                else:
+                    try:
+                        handle_dispatch(cfg, t, d, msg.get("id", ""))
+                    except Exception as e:
+                        qq.log(f"dispatch {t} failed: {e!r}")
     finally:
-        tg.log("bot: poller stopped")
+        ws.close()
 
 
-def skip_backlog(cfg: dict) -> int | None:
-    """Telegram queues updates server-side for ~24h. On the very first run, jump past
-    whatever is already sitting there — otherwise messages you sent the bot before this
-    plugin existed (setting up chat_id, say) would land in an agent as prompts.
-    Returns the starting offset, or None if the call failed and priming should retry."""
-    updates, err = tg.api(cfg, "getUpdates", {"offset": -1, "timeout": 0}, timeout=20, retries=2)
-    if err:
-        tg.log(f"bot: could not read the backlog ({err}); retrying")
-        return None
-    if not updates:
-        return 0
-    offset = updates[-1].get("update_id", 0) + 1
-    tg.log(f"bot: first run — skipping queued updates through {offset - 1}")
-    return offset
+class StopBot(Exception):
+    pass
 
 
-def poll_loop() -> None:
-    offset = tg.read_state(OFFSET, {}).get("offset", 0)
-    primed = offset > 0
-    announced = False
-    next_sweep = 0.0
-    failures = 0
+class ProtocolError(Exception):
+    pass
+
+
+def run_daemon(started_at: float) -> None:
+    session: dict = {"id": "", "seq": 0}
+    backoff = 5.0
     while True:
-        cfg = tg.load_config()
-        if cfg is None or not tg.chat_id(cfg):
+        if stop_requested(started_at):
+            break
+        cfg = qq.load_config()
+        if cfg is None or not qq.app_configured(cfg):
             time.sleep(30)
             continue
-        if not announced:
-            register_commands(cfg)
-            announced = True
-        if time.monotonic() >= next_sweep:
-            gone = tg.sweep_inbox(float(cfg.get("inbox_days", 7)))
-            if gone:
-                tg.log(f"bot: swept {gone} expired file(s) from the inbox")
-            next_sweep = time.monotonic() + SWEEP_EVERY
-        if not primed:
-            start = skip_backlog(cfg)
-            if start is None:
-                time.sleep(5)
-                continue
-            offset, primed = start, True
-            tg.write_state(OFFSET, {"offset": offset})
-        updates, err = tg.api(
-            cfg, "getUpdates",
-            {"offset": offset, "timeout": POLL_SECONDS, "allowed_updates": '["message","callback_query"]'},
-            timeout=POLL_SECONDS + 15, retries=1,
-        )
-        if err:
-            failures += 1
-            tg.log(f"bot: getUpdates failed ({err}); backing off")
-            time.sleep(min(60, 5 * failures))
-            continue
-        failures = 0
-        for update in updates or []:
-            # advance the offset before handling: a poisonous update must not be
-            # replayed forever on every restart
-            offset = update.get("update_id", 0) + 1
-            tg.write_state(OFFSET, {"offset": offset})
-            try:
-                handle_update(cfg, update)
-            except Exception as e:
-                tg.log(f"bot: handler error on update {update.get('update_id')}: {e!r}")
-
-
-def stop_poller() -> int:
-    """SIGTERM the running poller and wait for it to drop the lock. Returns its pid, or 0."""
-    pid = tg.bot_pid()
-    if not pid or not tg.bot_running():
-        return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        tg.log(f"bot: stop failed: {e!r}")
-        return 0
-    for _ in range(10):
-        if not tg.bot_running():
+        try:
+            url, err = qq.gateway_url(cfg)
+            if err or not url:
+                raise ProtocolError(f"gateway url: {err or 'empty'}")
+            serve(cfg, url, session, started_at)
+            backoff = 5.0
+        except StopBot:
             break
-        time.sleep(1)
-    return pid
+        except Exception as e:
+            qq.log(f"gateway session ended: {e!r}")
+        time.sleep(backoff)
+        backoff = min(60.0, backoff * 2)
+    try:
+        os.remove(qq.stop_flag_path())
+    except OSError:
+        pass
+    qq.log("bot: daemon stopped")
+
+
+def run_foreground() -> None:
+    lock = qq.bot_lock()
+    if lock is None:
+        qq.log("bot: another daemon holds the lock; exiting")
+        return
+    # the pid goes in its own file: the lock file is byte-locked, and Windows
+    # mandatory locks would deny other processes even a read
+    with open(qq.state_path(qq.PID_NAME), "w") as f:
+        f.write(str(os.getpid()))
+    started_at = time.time()
+    try:
+        os.remove(qq.stop_flag_path())
+    except OSError:
+        pass
+    qq.log(f"bot: daemon started pid={os.getpid()}")
+    try:
+        run_daemon(started_at)
+    finally:
+        qq.log("bot: poller exited")
 
 
 def main() -> None:
     if "--daemon" in sys.argv:
-        run_daemon()
+        run_foreground()
     elif "--stop" in sys.argv:
-        pid = stop_poller()
-        print(f"stopped poller pid={pid}" if pid else "poller not running")
+        pid = qq.stop_poller()
+        print(f"stopped daemon pid={pid}" if pid else "daemon not running")
     elif "--restart" in sys.argv:
-        stop_poller()
-        print("poller started" if tg.spawn_bot() else "poller still running — try again")
+        qq.stop_poller()
+        print("daemon started" if qq.spawn_bot() else "daemon still running — try again")
     elif "--status" in sys.argv:
-        print(f"poller running pid={tg.bot_pid()}" if tg.bot_running() else "poller not running")
+        print(f"daemon running pid={qq.bot_pid()}" if qq.bot_running() else "daemon not running")
     else:  # --ensure, and the default for the [[startup]] hook
-        print("poller started" if tg.spawn_bot() else f"poller already running pid={tg.bot_pid()}")
+        print("daemon started" if qq.spawn_bot()
+              else f"daemon already running pid={qq.bot_pid()}")
 
 
 if __name__ == "__main__":

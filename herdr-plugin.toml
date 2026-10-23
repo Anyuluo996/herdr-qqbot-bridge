@@ -1,38 +1,48 @@
-id = "telegram.bridge"
-name = "Telegram Bridge"
-version = "0.3.0"
+id = "qqbot.bridge"
+name = "QQ Bot Bridge"
+version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Drive your herdr agents from Telegram: push on done/blocked, reply to send text or files straight back in."
-platforms = ["macos", "linux"]
+description = "Drive your herdr agents from QQ official bot: push on done/blocked, quote-reply to send text or files straight back in."
+platforms = ["macos", "linux", "windows"]
 
-# herdr's server PATH doesn't include /opt/homebrew/bin, so bare `python3`
-# resolves to the system Python (3.9) which lacks tomllib (3.11+). Prepend
-# the Homebrew bin dir via env(1) so python3 resolves correctly on this
-# machine while staying portable to other layouts (linux, /usr/local).
+# Windows resolves the bare `python` off PATH; POSIX entries use env(1) to put
+# python3 first, because herdr's server PATH may miss Homebrew/local prefixes.
+# POSIX users without a `python` alias: the split entries below already call
+# python3, only the [[actions]] need editing on a POSIX machine.
 
-# Starts the reply poller with herdr. It spawns a detached process and returns
-# immediately, so it never delays startup. The event hook below re-checks it.
+# One-shot per herdr server start; it spawns the detached gateway daemon and exits.
 [[startup]]
-command = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "python3", "bot.py", "--ensure"]
+command = ["/usr/bin/env", "python3", "bot.py", "--ensure"]
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python", "bot.py", "--ensure"]
+platforms = ["windows"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "python3", "notify.py"]
+command = ["/usr/bin/env", "python3", "notify.py"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python", "notify.py"]
+platforms = ["windows"]
 
 [[actions]]
 id = "test"
-title = "Send Telegram test message"
+title = "Send QQ test message"
 contexts = ["pane", "workspace"]
-command = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "python3", "notify.py", "--test"]
+command = ["python", "notify.py", "--test"]
 
 [[actions]]
 id = "bot-status"
-title = "Telegram replies: poller status"
+title = "QQ replies: daemon status"
 contexts = ["pane", "workspace"]
-command = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "python3", "bot.py", "--status"]
+command = ["python", "bot.py", "--status"]
 
 [[actions]]
 id = "bot-restart"
-title = "Telegram replies: restart poller"
+title = "QQ replies: restart daemon"
 contexts = ["pane", "workspace"]
-command = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "python3", "bot.py", "--restart"]
+command = ["python", "bot.py", "--restart"]

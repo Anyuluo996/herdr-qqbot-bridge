@@ -1,103 +1,102 @@
-# Copy to the plugin config dir (herdr plugin config-dir telegram.bridge) as config.toml.
+# 复制为 config.toml 放到插件配置目录（herdr plugin config-dir qqbot.bridge 打印路径）。
 
-# From @BotFather
-bot_token = "REPLACE_ME:token"
-# Your numeric chat id (message @userinfobot, or getUpdates)
-chat_id = "REPLACE_ME"
+# QQ 开放平台 https://q.qq.com 机器人管理页里的 AppID / AppSecret
+app_id = "REPLACE_ME"
+app_secret = "REPLACE_ME"
 
-# Agent statuses that trigger a push: done, blocked, idle, working, unknown.
-# "done" = finished; "blocked" = waiting for your input.
+# 使用场景: "c2c" 单聊（推荐，限制最松） / "group" 群聊
+scene = "c2c"
+
+# 目标会话：留空时，第一条发给机器人的消息会自动绑定（auto_bind = true），
+# 绑定结果存在插件 state 目录 bound_target.json。也可显式填写 openid。
+# openid 不是 QQ 号，是平台分配的逐 bot 唯一串，绑定后可从日志/state 里复制。
+# c2c_openid = ""
+# group_openid = ""
+auto_bind = true
+
+# 额外允许驱动机器人的 openid 白名单（空 = 只允许绑定的会话/自动绑定第一个人）
+# allow_users = []
+
+# --- 推送 ---------------------------------------------------------------------
+
+# 触发推送的 agent 状态: done, blocked, idle, working, unknown
 statuses = ["done", "blocked"]
 
-# Only notify for these agents (herdr agent ids, e.g. "claude", "codex").
-# Empty or omitted = all agents.
+# 只推送这些 agent（herdr agent id，如 "claude"）。空/省略 = 全部。
 # agents = ["claude"]
 
-# herdr infers agent state by reading the terminal, and some CLIs blink through a state
-# mid-turn — grok flashes "blocked" for about a second as it starts, which would push a
-# notification before you had even asked it anything. Before sending, wait this long and
-# re-read the pane; if it has moved on, the transition was a flap and is dropped. This is
-# added latency on every notification. 0 disables it.
+# herdr 靠读终端推断状态，个别 CLI 会闪烁中间态（grok 启动时会闪 1 秒 blocked）。
+# 推送前先等这么久再复查一次面板，状态已变就丢弃。0 关闭。
 settle_ms = 4000
 
-# Skip repeat pushes for the same pane+status within this many seconds.
+# 同一 pane+status 在这么多秒内不重复推送。
 quiet_seconds = 5
 
-# Max characters of the agent's final reply to include. 0 = the whole thing, split
-# across as many messages as it takes (Telegram caps one message at 4096 characters
-# and rejects anything longer — it does not split for you).
+# agent 最终回复最多收录多少字符。0 = 全文，自动分片。
 snippet_chars = 0
 
-# Render the reply as markdown. Telegram only accepts b/i/u/s/code/pre/a/blockquote,
-# so headings become bold, lists become bullets, and tables become monospaced blocks.
-# A reply longer than a couple of lines goes in an expandable quote — tap to unfold —
-# so a chatty agent doesn't flood the chat. false sends flat, unformatted text.
+# 用 msg_type=2 Markdown 发送。QQ 的 Markdown 可能为部分 bot 需要申请权限，
+# 被拒绝时自动降级为纯文本重发，不会丢消息。false 直接发纯文本。
 markdown = true
 
-# Characters of the pane title kept in the header line. The header is one line —
-# status icon, agent, folder, title — so a phone's notification preview spends its
-# few visible lines on the reply instead of on metadata.
+# 单条消息分片字符数。QQ 未公布文本长度上限（超限报 40054007/40054018），
+# 实践 ~2000 以内安全；这里默认更保守。Telegram 版是 3600，QQ 版收紧了。
+chunk_chars = 1000
+
+# 单条通知最多拆成几条消息。注意：被动回复（引用你消息后的回复）单聊最多 4 条、
+# 群聊最多 5 条，超过会自动转主动消息。主动推送不受此限制。
+max_messages = 6
+
+# 标题行里 pane 标题保留的字符数。
 title_chars = 48
 
-# Hard cap on how many messages a single notification may span.
-max_messages = 8
+# 群聊场景把 URL 替换为域名 —— 群消息带 URL 会被直接拒绝（40054010）。单聊不受限。
+strip_group_urls = true
 
-# How a long reply is presented.
-#   "auto"  — fold it into an expandable quote. Telegram won't nest a code block inside
-#             a quote (it cuts the quote short and starts a new one), so inside a fold
-#             code and tables use inline monospace: one tidy block, no highlighting.
-#   "never" — no folding. Code blocks keep syntax highlighting and a copy button, and a
-#             long reply is simply long.
-fold = "auto"
+# 发送间隔（秒）：同一会话 QQ 限频 20 条/分钟，这里串行化排队。
+send_gap_seconds = 3.0
 
-# How many sent messages stay routable. The map is rewritten whole on every send, so it
-# is capped; replying to something older than this reports an error rather than guessing
-# an agent. Raise it if you reply to old notifications.
-msg_map_limit = 1000
+# --- 回复 ---------------------------------------------------------------------
 
-# --- replies -----------------------------------------------------------------
-
-# Read Telegram replies and feed them back into the agent they came from.
-# Set to false to keep notifications one-way (then no poller process runs).
+# 接收 QQ 回复并喂给对应 agent。false = 单向推送（守护进程仍会启动以完成绑定，
+# 但不会把消息注入 agent）。
 replies = true
 
-# Where a message that isn't a reply goes: true = the most recently active agent,
-# false = nowhere, so you always have to reply to a notification or use /agents.
+# 不引用任何通知直接发消息时投给谁：true = 最近活跃的 agent，false = 提示先 /agents。
 reply_to_latest = true
 
-# Extra allowlist on top of chat_id: only these Telegram user ids may drive agents.
-# Empty or omitted = anyone in the configured chat (i.e. just you, in a private chat).
-# allowed_user_ids = [123456789]
-
-# Default number of terminal lines /read returns.
+# /read 默认返回的终端行数。
 read_lines = 40
 
-# `herdr agent prompt` writes the text and the Enter in one burst. A busy agent queues
-# that fine, but an idle Claude Code folds the Enter into its paste detection and leaves
-# the text sitting in the input box. So if the agent hasn't started working after
-# submit_wait_ms, press Enter once more. Turn off if your agent double-submits.
+# `herdr agent prompt` 一次性写入文本和回车。空闲的 Claude Code 可能把回车折叠进
+# 粘贴检测，文本停在输入框。若 submit_wait_ms 后 agent 没开工，补一次回车。
+# 如果你的 agent 会出现重复提交，关掉它。
 submit_fallback = true
 submit_wait_ms = 2500
 
-# --- attachments -------------------------------------------------------------
+# 网关断线重连后 RESUME 重放的历史消息，超过这个分钟数的直接丢弃（防止旧消息
+# 灌进 agent 当 prompt）。
+stale_drop_minutes = 15
 
-# Accept photos and files sent to the bot. herdr's injection channel is text only, so
-# the file is saved to <state dir>/inbox/ and the agent is handed its absolute path,
-# preceded by the caption when there is one. false replies that they're turned off.
+# --- 附件 ---------------------------------------------------------------------
+
+# 接收发来的文件：保存到 <state dir>/inbox/ 并把绝对路径交给 agent（可带说明文字）。
 accept_files = true
 
-# Delete inbox files older than this many days. The poller sweeps every 6 hours and on
-# startup. 0 keeps everything forever.
+# 自动清理多少天前的 inbox 文件（守护进程每 6 小时巡检）。0 永久保留。
 inbox_days = 7
 
-# Refuse anything larger. Telegram bots cannot fetch files above 20 MB at all, so this
-# only ever lowers the ceiling.
+# 拒绝超过这个大小的文件。QQ 入站限制：图片 8MB、语音/视频/文件 20MB、
+# 单消息最多 5 个附件，这里只会更严不会更松。
 max_file_mb = 20
 
-# --- network -----------------------------------------------------------------
+# --- 网络/平台 ----------------------------------------------------------------
 
-# Optional: proxy for reaching api.telegram.org, e.g. "http://127.0.0.1:7890"
+# 可选：访问 QQ API 用的代理。国内机器一般不需要（这也是换掉 Telegram 版的理由之一）。
 # proxy = ""
 
-# Optional: alternative API endpoint (reverse proxy of api.telegram.org)
-# api_base = "https://api.telegram.org"
+# 可选：API 网关地址（默认 https://api.sgroup.qq.com）
+# api_base = "https://api.sgroup.qq.com"
+
+# 可选：WebSocket intents 位掩码，默认 1<<25 | 1<<26（单聊+群@消息、按钮回调）。
+# intents = 100663296

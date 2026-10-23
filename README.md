@@ -1,121 +1,107 @@
-# herdr-telegram-bridge
+# herdr-qqbot-bridge
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![herdr 0.7+](https://img.shields.io/badge/herdr-0.7%2B-8a2be2)
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab)
-![platforms: linux • macOS](https://img.shields.io/badge/platforms-linux%20%E2%80%A2%20macOS-informational)
+用 **QQ 官方机器人**（QQ 开放平台，非 NapCat/OneBot）驱动 [herdr](https://herdr.dev) 里的编码 agent：agent 完成或阻塞时推送结果到 QQ，引用回复即可把文字（或文件）直接发回那个 agent 的终端。
 
-**Walk away from your agents and answer them from your phone.** When a [herdr](https://herdr.dev) agent finishes or gets stuck, you get a Telegram message with what it actually said — rendered, not truncated. Reply to that message and your text goes straight into that agent's prompt. That is the whole interaction: **reply to the notification you got.**
+Fork 自 [cokekitten/herdr-telegram-bridge](https://github.com/cokekitten/herdr-telegram-bridge)（MIT），把 Telegram 传输层整体替换为 QQ 开放平台 API v2，并移植到 Windows。herdr 侧逻辑（事件钩子、`herdr agent prompt` 注入、各 agent 会话嗅探、inbox）与上游保持一致。
 
 ```
-✅ claude · sunrise · Fix the flaky integration test
-   All three tests pass now. The race was in the fixture
-   teardown — the DB handle outlived the transaction…
-
-                        also add a regression test for it  ↰
-➡️ sent to claude · ~/dev/sunrise
-
-   … 40 seconds later …
-
-✅ claude · sunrise · Fix the flaky integration test
-   Added `test_teardown_ordering`. Full suite green: 41 passed.
+agent done/blocked ──> notify.py（事件钩子）──> QQ 推送
+QQ 引用回复 ──> bot.py（网关守护）──> herdr agent prompt ──> agent 终端
 ```
 
-No relay server, no tunnel, no port to open, no companion app. The plugin makes **outbound** long-poll requests to Telegram and nothing else — which is exactly why it works from a laptop on hotel wifi.
+## 功能
 
-## Why you'd want it
-
-- **Reply, don't command.** Every notification is addressed to the agent it came from, so replying to it routes back to that pane. Ten agents running, ten conversations — Telegram's own reply threading keeps them straight. Commands exist, but you rarely need one.
-- **The whole answer, readable.** The agent's final reply is rendered into Telegram's markup — headings, bullets, links, syntax-labelled code, monospaced tables. Long answers fold into an expandable quote so a chatty agent can't flood the chat, and anything past Telegram's 4096-character ceiling is split across messages that all remain replyable.
-- **Send it a screenshot.** Photos and files land on disk and the agent is handed the path — point it at a stack trace, a design mock, or a log without getting to a keyboard.
-- **Nothing to run.** No relay, no tunnel, no daemon you have to remember to start. The poller is launched by herdr itself and self-heals if it dies.
-- **It only listens to you.** Only the chat id you configure is accepted; everything else is logged and dropped. `allowed_user_ids` narrows it further to specific accounts.
-
-## What it does
-
-**Notifications** — one line of context (status, agent, directory, pane title) and then the agent's final reply. The header is deliberately short: a phone's notification preview gets only a few lines and they should go to the reply. herdr reports `done` only for unfocused panes, so the plugin also tracks `working → idle` per pane and treats that as a completion — you get told either way. `statuses`, an `agents` allowlist and a `quiet_seconds` debounce control what is worth interrupting you for.
-
-**Replies** — your text is submitted with `herdr agent prompt`; the agent starts working, finishes, and the next notification arrives on its own. A message that isn't a reply goes to the most recently active agent, so a back-and-forth doesn't need long-pressing every time.
-
-**Commands** — published with `setMyCommands`, so they show up in Telegram's menu button:
-
-| | |
+| 功能 | 说明 |
 |---|---|
-| `/agents` | every agent as a button, grouped under its working directory, most recently active group first — with status, agent and pane title, because agents often share a directory and the title is what tells them apart |
-| `/read [lines]` | that agent's recent terminal output |
-| `/esc` | send Escape to interrupt it |
-| `/help` | how replying works |
+| 状态推送 | agent done/blocked 时推送最后一条回复（支持 claude/codex/pi/grok/kimi/hermes/opencode 的会话嗅探），长文自动分片 |
+| 引用路由 | 引用某条通知 = 精确路由到那个 agent；不引用 = 最近活跃的 agent |
+| /agents | 按钮面板选择 agent（QQ 内嵌键盘回调按钮） |
+| /read | 查看 agent 最近终端输出，超长自动改发 .txt 文件 |
+| /esc | 向 agent 发送 Esc 中断 |
+| 收文件 | 发给机器人的图片/文件保存到 inbox，路径交给 agent |
+| 防打扰 | 抖动确认（settle_ms）、去抖（quiet_seconds）、断线重放消息按时间丢弃 |
+| 平台适配 | msg_seq 状态机、被动回复超限自动转主动、Markdown 无权限自动降级纯文本、群聊 URL 自动脱敏、20 条/分钟限速队列 |
 
-**Attachments** — photos, documents, voice notes and video are saved to `<state dir>/inbox/`, and the agent is prompted with your caption plus the absolute path. Sender-supplied filenames are flattened to a plain basename, and the inbox is swept of anything older than `inbox_days` (7) every six hours.
+## 安装
 
-**Reply text** is read from each agent CLI's own session storage:
-
-| Agent | Source |
-|---|---|
-| claude (Claude Code) | `~/.claude/projects/*/<session>.jsonl` |
-| codex | `~/.codex/sessions/…/rollout-*.jsonl` |
-| pi | session path reported by herdr |
-| opencode | `~/.local/share/opencode/opencode.db`, session matched by directory + title when herdr reports none |
-| grok | `~/.grok/sessions/<cwd>/…/chat_history.jsonl`, session pinned via the pane's process |
-| kimi (Kimi Code) | `~/.kimi-code/sessions/…/wire.jsonl` |
-| hermes | `~/.hermes/state.db` |
-
-Anything else still notifies and still takes replies — just without the transcript excerpt.
-
-Not every CLI sets a useful terminal title: pi shows `π - <user>`, hermes shows `π - <dir>`, codex shows the directory, a fresh Claude Code shows its own name. When herdr's title says nothing, the session's opening prompt is used instead — skipping the synthetic context (`AGENTS.md` dumps, `<user_info>` blocks) that agents front-load as user messages. A pane that has not been asked anything yet legitimately has no title either way.
-
-## Install
-
-```sh
-herdr plugin install cokekitten/herdr-telegram-bridge
+```bash
+herdr plugin install Anyuluo996/herdr-qqbot-bridge
+# 或本地开发
+herdr plugin link /path/to/herdr-qqbot-bridge
 ```
 
-Plugins hot-load, so no herdr restart is needed. Requires Python 3.11+ (`tomllib`) and `curl`.
+### 配置
 
-## Configure
+1. 在 [QQ 开放平台](https://q.qq.com) 手机 QQ 扫码注册，**创建机器人**，拿到 `AppID` 和 `AppSecret`。
+2. 写配置：
 
-Create a bot with [@BotFather](https://t.me/BotFather), send it any message, then read your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`.
-
-```sh
-cp config.example.toml "$(herdr plugin config-dir telegram.bridge)/config.toml"
-$EDITOR "$(herdr plugin config-dir telegram.bridge)/config.toml"    # bot_token, chat_id
-chmod 600 "$(herdr plugin config-dir telegram.bridge)/config.toml"  # it holds your token
+```bash
+herdr plugin config-dir qqbot.bridge   # 打印配置目录
+cp config.example.toml <配置目录>/config.toml
+# 编辑 app_id / app_secret
 ```
 
-Then send a test message — either the **Send Telegram test message** action in herdr's plugin menu, or:
+3. **绑定会话**：给机器人发任意一条消息（单聊直接私聊它；群聊先在开放平台把机器人加进群）。默认 `auto_bind = true`，第一个发消息的会话自动绑定，机器人会回复确认。openid 会记录在插件 state 目录的 `bound_target.json` 里。
 
-```sh
-herdr plugin action invoke telegram.bridge.test
+4. 重启 daemon（或重启 herdr）：
+
+```bash
+herdr plugin action qqbot.bridge bot-restart
+herdr plugin action qqbot.bridge test   # 收到测试消息即通
 ```
 
-Everything else has a working default. [`config.example.toml`](config.example.toml) documents the full set: which `statuses` notify, an `agents` filter, `settle_ms`, `quiet_seconds`, `snippet_chars`, `markdown` / `fold` / `max_messages`, `replies` / `reply_to_latest` / `allowed_user_ids` / `read_lines`, `accept_files` / `inbox_days` / `max_file_mb`, and `proxy` / `api_base` if you need to reach Telegram through something else.
+## 使用
 
-To use the bot in a group rather than a private chat, disable its privacy mode in @BotFather (`/setprivacy`) — and note that everyone in that group can then drive your agents unless you set `allowed_user_ids`.
+- agent 完成时收到推送，**长按/引用回复**那条通知，文字直接进入对应 agent 的终端
+- 直接发消息（不引用）= 发给最近活跃的 agent
+- `/agents` 选人，`/read [行数]` 看输出，`/esc` 中断，`/help` 帮助
+- 发图片/文件给机器人 → 存到 inbox → agent 收到绝对路径
 
-## How it works
+## 与 Telegram 版的差异（为什么不能照搬）
 
-Telegram cannot push to a laptop, so `bot.py` long-polls `getUpdates` as a detached singleton. The manifest's `[[startup]]` hook launches it with herdr, the status-change hook re-checks it on every agent transition so a dead poller comes back by itself, and a `flock` keeps exactly one alive. Two actions in herdr's plugin menu — **poller status** and **restart poller** — cover the rest (`python3 bot.py --status|--restart|--stop`).
+| 能力 | Telegram | QQ 官方 |
+|---|---|---|
+| 回复路由 | reply_to message_id | 引用 + REFIDX 映射（发送时记录 `ext_info.ref_idx`，回复事件反查） |
+| 事件获取 | getUpdates 长轮询 | WebSocket 网关（含心跳/RESUME，`qqws.py` 手写零依赖客户端） |
+| 被动回复 | 无限制 | 单聊 60 分钟/4 次，群聊 5 分钟/5 次，超限自动转主动消息 |
+| 主动消息 | 无限制 | 用户可关闭「允许主动发送」；频控 20 条/分钟/关系、1000 条/天（2026 政策） |
+| 富文本 | HTML 子集 + 可折叠引用 | msg_type=2 Markdown（可能需权限，自动降级）；无可折叠块，超长输出改发 .txt 文件 |
+| 按钮 | callback_data 64 字节 | 回调按钮可用但 **label ≤ 10 字符** |
+| 群聊 URL | 无限制 | **直接拒绝（40054010）**，自动替换为域名 |
+| 内容审核 | 无 | 出站内容过风控（40034006），代码内容偶发被拦 |
+| 网络 | 常需代理 | 国内直连 |
 
-Routing is a `message id → pane` map recorded as each notification is sent, capped at `msg_map_limit` entries. Replying to something older than the cap reports an error rather than quietly retargeting whichever agent happens to be current — as does replying to an agent whose pane has since been closed. Nothing is ever redirected on your behalf.
+其他平台硬性限制（配置无法绕过）：C2C 需好友/添加关系（40054004）；未认证机器人只能加自己为群主/管理员的群；个人身份证认证（免费）可放宽部分频控。
 
-A few behaviours of the surrounding systems are worth writing down, because each one caused a bug:
+## Windows 说明
 
-- **`herdr agent prompt` writes the text and the Enter in one burst.** A busy agent queues that fine, but an *idle* Claude Code folds the trailing Enter into its paste-detection window and strands the text in the input box. So when the agent wasn't already working, the poller waits `submit_wait_ms` for it to start and presses Enter once more if it never does.
-- **Telegram rejects messages over 4096 characters** rather than splitting them the way the client does when you paste a wall of text. Splitting therefore happens here, and every part maps back to the same agent.
-- **Telegram won't nest a code block inside a blockquote** — the client ends the quote, emits the block, then opens a fresh one, so one reply arrives as several separately-collapsing pieces. Inside a fold, code and tables use inline monospace instead; `fold = "never"` trades folding away for syntax highlighting and copy buttons.
-- **An untagged `<pre>` gets its language guessed** by the client and highlighted accordingly, which turns a plain table into confetti. Every block therefore carries an explicit tag, `plaintext` included.
-- **herdr infers agent state by reading the terminal, and that flaps.** grok flashes `blocked` for about a second as a conversation starts, and a pane can blink through `idle` mid-turn. Every notification therefore waits `settle_ms` and re-reads the pane before sending, dropping the transition if it did not hold.
-- **grok files sessions under a url-encoded cwd, not a session id**, and herdr reports no session reference for it — so several conversations share a directory, and a brand new one has no transcript until its first reply lands. Picking the newest by mtime hands back the *previous* conversation, so the session is instead pinned by asking the pane's grok process which `events.jsonl` it holds open.
-- **`getUpdates` serves ~24h of backlog on first run.** That is skipped, so the messages you sent the bot while setting up `chat_id` never arrive as prompts.
+原版仅支持 macOS/Linux（`fcntl`、`lsof`）。本 fork：
 
-Logs are in `bridge.log` in the plugin state dir, plus `herdr plugin logs --plugin telegram.bridge`.
+- 锁与守护进程派生改为跨平台（`msvcrt`/`DETACHED_PROCESS`）
+- 移除 grok 的 `lsof` 特判（mtime 回退）
+- manifest 按 `platforms` 拆分启动/事件命令；POSIX 上若 `python` 不存在，编辑 manifest 里 `[[actions]]` 的 `python` 为 `python3`
+- 需要 Python ≥ 3.11（`tomllib`）
 
-## Limits
+## 沙箱实测清单（上线前建议跑一遍）
 
-- Telegram bots cannot download files larger than **20 MB**; `max_file_mb` only lowers that further.
-- The injection channel is text, so an attachment reaches the agent as a *path*, not as pixels. Agents that open files themselves (Claude Code among them) handle that transparently; others just see a path.
-- Interrupting is a plain Escape keypress. If an agent is sitting on a permission dialog rather than a prompt, `/esc` and the Enter fallback act on that dialog — set `submit_fallback = false` if you would rather they never did.
+- [ ] 单聊被动窗口实际值（官方总览写 60 分钟，API 页写 5 分钟，以实测为准）
+- [ ] 文本长度实际上限（默认 chunk_chars=1000 保守值）
+- [ ] 你的 bot 的 Markdown 是否免申请
+- [ ] 按钮回调事件 `data.resolved.button_data` 字段结构
+- [ ] 引用回复事件里 `message_scene.ext` 的 REFIDX 字段名
+
+## 文件结构
+
+```
+herdr-plugin.toml   manifest（startup/events/actions，按平台拆分）
+config.example.toml 配置模板（中文注释）
+qq.py               共享层：herdr CLI、token/REST、限速、msg_seq、路由、跨平台进程管理
+qqws.py             零依赖 RFC6455 WebSocket 客户端
+bot.py              网关守护进程：消息/命令/按钮 → agent
+notify.py           pane.agent_status_changed 钩子 → QQ 推送
+tests/smoke_local.py 离线自测：WS 握手/帧、分片、路由、脱敏
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT（承袭上游；详见 LICENSE）
